@@ -10,8 +10,9 @@ and submit an AI-labelled transcript to `plzsayyes3/mynotebook`.
 
 The initial commit imports the tested StickS3 firmware from VoiceStick as an
 audio and board baseline. **It is not yet a local recorder.** The imported code
-currently sends Opus packets over BLE and uses a 1.984 MiB storage partition.
-Do not rely on it to retain recordings while offline.
+currently sends Opus packets over BLE. The partition table now keeps OTA and
+reserves internal Flash for recording, but no filesystem is mounted yet. Do not
+rely on this firmware to retain recordings while offline.
 
 The first functional milestone is one-button recording to independent Ogg/Opus
 files in internal Flash. Success requires:
@@ -24,6 +25,25 @@ files in internal Flash. Success requires:
 
 Sync, transcription, and notebook ingestion follow only after the storage
 milestone is verified on the device.
+
+## Flash layout and OTA
+
+The 8 MiB Flash is split into two 2 MiB OTA app slots and a `0x3f0000` byte
+(3.9375 MiB) FAT data partition, plus NVS, OTA metadata, and PHY data. The
+VoiceStick v0.3.2 OTA image is 1,418,048 bytes, leaving 679,104 bytes of headroom
+in each app slot before adding local storage and Wi-Fi Sync code. Each future
+firmware image must be checked against the 2 MiB slot limit before release.
+
+At a fixed 20 kbps, 20 minutes of Opus audio is 3,000,000 bytes before Ogg and
+filesystem overhead. Grouping multiple packets per Ogg page is preferred; even
+one page for every 60 ms packet adds roughly 560,000 bytes of page overhead.
+The 20-minute guarantee remains a device test gate, not a claim based only on
+partition size.
+
+Changing the partition table requires an initial USB flash of the new table.
+VoiceStick's existing BLE app OTA then continues between `ota_0` and `ota_1`;
+that app-only updater does not migrate a previously installed partition table.
+Back up any existing device recordings before installing a different table.
 
 ## Sources
 
