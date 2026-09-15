@@ -14,9 +14,11 @@
  * states and side-button Sync.
  */
 
+#include "audio_pipeline.h"
 #include "voice_ble.h"
 
 static voice_ble_connection_cb_t s_local_recorder_app_connection_cb;
+static voice_ble_control_cb_t s_local_recorder_app_control_cb;
 
 static void local_recorder_connection_proxy(bool connected)
 {
@@ -35,6 +37,46 @@ static inline void local_recorder_set_connection_callback(
 {
     s_local_recorder_app_connection_cb = callback;
     voice_ble_set_connection_callback(local_recorder_connection_proxy);
+}
+
+static inline void local_recorder_set_control_callback(
+    voice_ble_control_cb_t callback)
+{
+    s_local_recorder_app_control_cb = callback;
+    voice_ble_set_control_callback(callback);
+}
+
+static void local_recorder_audio_error(esp_err_t error)
+{
+    (void)error;
+    if (s_local_recorder_app_control_cb) {
+        s_local_recorder_app_control_cb(
+            "{\"event\":\"ui_state\",\"state\":\"error\",\"text\":\"Recording failed\"}");
+    }
+}
+
+static inline esp_err_t local_recorder_audio_init(void)
+{
+    esp_err_t err = audio_pipeline_init();
+    if (err == ESP_OK) {
+        audio_pipeline_set_error_callback(local_recorder_audio_error);
+    }
+    return err;
+}
+
+static inline esp_err_t local_recorder_ble_init(void)
+{
+    esp_err_t err = voice_ble_init();
+    if (err == ESP_OK && s_local_recorder_app_control_cb) {
+        /*
+         * The imported VoiceStick defaults to hold-to-talk and normally lets a
+         * BLE host switch interaction modes. Offline capture has no host, so
+         * force the target UX: one front-button click starts, the next stops.
+         */
+        s_local_recorder_app_control_cb(
+            "{\"event\":\"interaction_mode\",\"mode\":\"click_to_talk\"}");
+    }
+    return err;
 }
 
 static inline bool local_recorder_ble_ready(void)
@@ -84,8 +126,15 @@ static inline esp_err_t local_recorder_button_click(const char *button,
     return ESP_FAIL;
 }
 
+/*
+ * Keep these macros after the wrappers so calls inside the wrappers resolve to
+ * the original VoiceStick symbols rather than recursively expanding.
+ */
 #define voice_ble_set_connection_callback local_recorder_set_connection_callback
+#define voice_ble_set_control_callback local_recorder_set_control_callback
+#define voice_ble_init local_recorder_ble_init
 #define voice_ble_is_ready local_recorder_ble_ready
 #define voice_ble_send_button_down local_recorder_button_down
 #define voice_ble_send_button_up local_recorder_button_up
 #define voice_ble_send_button_click local_recorder_button_click
+#define audio_pipeline_init local_recorder_audio_init
