@@ -33,7 +33,7 @@ jobs:
             idf.py build
             image="build/voice_stick.bin"
             test -f "$image"
-            size="$(wc -c < "$image" | tr -d ' ')"
+            size="$(stat -c %s "$image")"
             limit=$((0x200000))
             echo "firmware image: ${size} bytes; OTA slot limit: ${limit} bytes"
             if [ "$size" -ge "$limit" ]; then
