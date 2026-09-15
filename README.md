@@ -8,40 +8,85 @@ and submit an AI-labelled transcript to `plzsayyes3/mynotebook`.
 
 ## Implementation status
 
-The initial commit imports the tested StickS3 firmware from VoiceStick as an
-audio and board baseline. **It is not yet a local recorder.** The imported code
-currently sends Opus packets over BLE. The partition table now keeps OTA and
-reserves internal Flash for recording, but no filesystem is mounted yet. Do not
-rely on this firmware to retain recordings while offline.
+The firmware baseline comes from VoiceStick, but the current local-recording MVP
+no longer uses BLE as the audio sink. VoiceStick still supplies the proven
+StickS3 board, ES8311/I2S, Opus, button, display, power, and OTA foundation.
 
-The first functional milestone is one-button recording to independent Ogg/Opus
-files in internal Flash. Success requires:
+On `feature/local-recording-mvp` the first storage implementation now exists:
 
-- Recording without BLE, Wi-Fi, phone, or Mac present.
-- At least 20 minutes of accumulated pending clips.
-- A failed or interrupted recording cannot overwrite earlier completed clips.
-- Packet or write backlog produces an explicit error, never silent audio loss.
-- Boot leaves any interrupted clip for recovery or inspection.
+- 16 kHz mono audio is encoded by the existing VoiceStick Opus encoder at
+  20 kbps using 60 ms frames.
+- Encoded Opus packets go to a dedicated Flash-writer queue rather than the BLE
+  audio queue.
+- Queue overflow is a recording failure. No oldest-packet drop path remains.
+- A dedicated `recording_store` component mounts the internal FAT partition and
+  writes independent Ogg/Opus recordings.
+- Recording starts as `*.part`; only a successful close, flush, and sync renames
+  it to `*.ogg`.
+- An interrupted or failed recording is retained as `*.part` for inspection
+  instead of overwriting or deleting earlier completed clips.
+- FAT auto-formatting is enabled only when the raw recording partition still
+  appears blank. A later mount failure does not trigger a destructive retry.
+- Ogg pages group up to 10 Opus packets and the file is periodically flushed and
+  `fsync`ed to limit the amount of audio exposed to sudden power loss.
+- The imported app shell is temporarily shimmed so BLE readiness, BLE button
+  notifications, and BLE disconnects cannot veto or terminate local capture.
 
-Sync, transcription, and notebook ingestion follow only after the storage
+**This code has not yet passed the StickS3 build and device gates below.** Do not
+consider local recording reliable until those tests pass.
+
+## First functional milestone
+
+One-button recording to independent Ogg/Opus files in internal Flash is accepted
+only when all of the following are verified on the physical StickS3:
+
+- Recording starts and stops with no BLE, Wi-Fi, phone, or Mac present.
+- A completed `.ogg` decodes and plays from beginning to end.
+- Multiple recordings create independent files and do not overwrite each other.
+- At least 20 minutes of accumulated pending clips fit and remain readable.
+- A failed or interrupted recording cannot damage earlier completed clips.
+- Packet or write backlog reports failure; audio is never silently dropped.
+- Sudden reset/power interruption leaves a `.part` file and previously completed
+  `.ogg` files intact.
+- Reboot reports retained `.part` files rather than auto-deleting them.
+
+Sync, transcription, and notebook ingestion follow only after this storage
 milestone is verified on the device.
+
+## Device test order
+
+1. Build the firmware and confirm the final application image still fits each
+   2 MiB OTA slot.
+2. USB-flash the partition table and firmware once; an app-only OTA cannot move
+   existing partition boundaries.
+3. Boot with BLE unavailable and verify the recording FAT partition mounts.
+4. Record 10–30 seconds with the front button, stop, and confirm an `.ogg` file
+   is finalized.
+5. Copy/read the file and verify duration and intelligible audio with a standard
+   Ogg/Opus decoder.
+6. Create several short recordings and verify unique filenames and preservation
+   across reboot.
+7. Record for 20 minutes and measure actual file size and remaining FAT space.
+8. During another recording, force reset/power loss after several seconds;
+   verify a `.part` remains and all earlier `.ogg` files are unchanged.
+9. Only after the above passes, begin side-button Wi-Fi Sync work.
 
 ## Flash layout and OTA
 
 The 8 MiB Flash is split into two 2 MiB OTA app slots and a `0x3f0000` byte
 (3.9375 MiB) FAT data partition, plus NVS, OTA metadata, and PHY data. The
-VoiceStick v0.3.2 OTA image is 1,418,048 bytes, leaving 679,104 bytes of headroom
-in each app slot before adding local storage and Wi-Fi Sync code. Each future
-firmware image must be checked against the 2 MiB slot limit before release.
+VoiceStick v0.3.2 OTA image used as the baseline was 1,418,048 bytes, leaving
+679,104 bytes of headroom in each app slot before local recorder and later Wi-Fi
+Sync code are added. Every firmware image must be checked against the 2 MiB slot
+limit before release.
 
-At a fixed 20 kbps, 20 minutes of Opus audio is 3,000,000 bytes before Ogg and
-filesystem overhead. Grouping multiple packets per Ogg page is preferred; even
-one page for every 60 ms packet adds roughly 560,000 bytes of page overhead.
-The 20-minute guarantee remains a device test gate, not a claim based only on
-partition size.
+At a fixed 20 kbps, 20 minutes of Opus audio is 3,000,000 bytes before Ogg,
+FAT, and wear-levelling overhead. The current writer groups up to 10 × 60 ms
+Opus packets per Ogg page to keep container overhead small. The 20-minute target
+remains a physical-device capacity test, not a claim based only on arithmetic.
 
 Changing the partition table requires an initial USB flash of the new table.
-VoiceStick's existing BLE app OTA then continues between `ota_0` and `ota_1`;
+VoiceStick's existing BLE app OTA can then continue between `ota_0` and `ota_1`;
 that app-only updater does not migrate a previously installed partition table.
 Back up any existing device recordings before installing a different table.
 
@@ -52,5 +97,6 @@ at commit `e865d68c1d96411571cbe1501a301ebe3c98f3b3`. Its original MIT
 license and copyright notice are preserved in [LICENSE](LICENSE).
 
 The deferred Sync queue and server contract are being evaluated against
-[`guzus/open-plaud`](https://github.com/guzus/open-plaud). No code from that
-repository is included yet.
+[`guzus/open-plaud`](https://github.com/guzus/open-plaud). Its Ogg/Opus writer
+was used as a design reference; this repository implements its local packet
+writer separately around the existing VoiceStick encoder.
