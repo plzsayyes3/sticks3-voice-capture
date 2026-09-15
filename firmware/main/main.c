@@ -69,7 +69,7 @@ typedef enum {
     INTERACTION_MODE_CLICK_TO_TALK,
 } interaction_mode_t;
 
-static interaction_mode_t s_interaction_mode = INTERACTION_MODE_HOLD_TO_TALK;
+static interaction_mode_t s_interaction_mode = INTERACTION_MODE_CLICK_TO_TALK;
 
 static const char *app_ui_state_name(app_ui_state_t state)
 {
@@ -96,6 +96,7 @@ typedef enum {
     APP_EVENT_UI_STATE,
     APP_EVENT_BLE_CONNECTED,
     APP_EVENT_BLE_DISCONNECTED,
+    APP_EVENT_AUDIO_ERROR,
     APP_EVENT_POWER_IRQ,
     APP_EVENT_BATTERY_REFRESH,
     APP_EVENT_ENTER_DEEP_SLEEP,
@@ -110,6 +111,7 @@ typedef struct {
     app_event_type_t type;
     uint32_t written;
     uint32_t size;
+    esp_err_t error;
     char state[32];
     char text[96];
 } app_event_t;
@@ -344,7 +346,7 @@ static uint32_t start_recording(void)
     const bool ble_ready = voice_ble_is_ready();
     const bool ota_active = voice_ble_ota_is_active();
     const bool ui_allows_start = app_ui_allows_recording_start();
-    if (s_recording || s_ota_updating || ota_active || !ble_ready || !ui_allows_start) {
+    if (s_recording || s_ota_updating || ota_active || !ui_allows_start) {
         ESP_LOGW(TAG,
                  "start recording denied: recording=%d ota=%d ble_ota=%d ble_ready=%d ui_state=%d",
                  s_recording, s_ota_updating, ota_active, ble_ready, s_app_ui_state);
@@ -355,6 +357,7 @@ static uint32_t start_recording(void)
     esp_err_t err = acquire_recording_pm_locks();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "acquire recording pm locks failed: %s", esp_err_to_name(err));
+        s_app_ui_state = APP_UI_STATE_ERROR;
         ui_status_set_error("Power lock failed");
         return 0;
     }
@@ -363,6 +366,7 @@ static uint32_t start_recording(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "audio start failed: %s", esp_err_to_name(err));
         release_recording_pm_locks();
+        s_app_ui_state = APP_UI_STATE_ERROR;
         ui_status_set_error("Audio start failed");
         return 0;
     }
@@ -383,10 +387,20 @@ static uint32_t stop_recording(void)
 
     const uint32_t session_id = audio_pipeline_session_id();
     s_recording = false;
-    audio_pipeline_stop();
+    esp_err_t err = audio_pipeline_stop();
     release_recording_pm_locks();
     restart_display_dim_timer();
     restart_deep_sleep_timer();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "audio stop failed: %s", esp_err_to_name(err));
+        s_app_ui_state = APP_UI_STATE_ERROR;
+        ui_status_set_error("Recording failed");
+    } else if (!voice_ble_is_ready()) {
+        s_app_ui_state = APP_UI_STATE_READY;
+        ui_status_set_idle();
+        note_activity();
+    }
     return session_id;
 }
 
@@ -445,6 +459,22 @@ static void queue_ui_state_event(const char *state, const char *text)
     if (xQueueSend(s_app_event_queue, &event, 0) != pdTRUE) {
         ESP_LOGW(TAG, "drop ui_state state=%s: app queue full",
                  event.state[0] ? event.state : "nil");
+    }
+}
+
+static void audio_pipeline_error_cb(esp_err_t error)
+{
+    if (!s_app_event_queue) {
+        ESP_LOGE(TAG, "recording failed before app queue ready: %s", esp_err_to_name(error));
+        return;
+    }
+
+    app_event_t event = {
+        .type = APP_EVENT_AUDIO_ERROR,
+        .error = error,
+    };
+    if (xQueueSend(s_app_event_queue, &event, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "drop recording error event: %s", esp_err_to_name(error));
     }
 }
 
@@ -609,7 +639,8 @@ static void app_event_task(void *arg)
                 esp_err_t primary_up_err = voice_ble_send_button_click("primary", primary_duration_ms,
                                                                        s_primary_session_id);
                 if (s_primary_session_id != 0 && primary_up_err != ESP_OK) {
-                    apply_app_ui_state("ready", "");
+                    ESP_LOGD(TAG, "BLE stop notification skipped/failed: %s",
+                             esp_err_to_name(primary_up_err));
                 }
                 s_primary_down_us = 0;
                 s_primary_session_id = 0;
@@ -630,9 +661,8 @@ static void app_event_task(void *arg)
                     ? voice_ble_send_button_click("primary", 0, s_primary_session_id)
                     : voice_ble_send_button_down("primary", s_primary_session_id);
                 if (s_primary_session_id != 0 && primary_down_err != ESP_OK) {
-                    (void)stop_recording();
-                    s_primary_session_id = 0;
-                    apply_app_ui_state("ready", "");
+                    ESP_LOGD(TAG, "BLE start notification skipped/failed: %s",
+                             esp_err_to_name(primary_down_err));
                 }
             }
             break;
@@ -652,7 +682,8 @@ static void app_event_task(void *arg)
             esp_err_t primary_up_err = voice_ble_send_button_up("primary", primary_duration_ms,
                                                                 s_primary_session_id);
             if (s_primary_session_id != 0 && primary_up_err != ESP_OK) {
-                apply_app_ui_state("ready", "");
+                ESP_LOGD(TAG, "BLE release notification skipped/failed: %s",
+                         esp_err_to_name(primary_up_err));
             }
             s_primary_down_us = 0;
             s_primary_session_id = 0;
@@ -672,19 +703,38 @@ static void app_event_task(void *arg)
             apply_app_ui_state(event.state, event.text);
             break;
         case APP_EVENT_BLE_CONNECTED:
-            s_app_ui_state = APP_UI_STATE_READY;
-            ui_status_set_idle();
+            if (s_recording) {
+                s_app_ui_state = APP_UI_STATE_RECORDING;
+                ui_status_set_recording(audio_pipeline_session_id());
+            } else {
+                s_app_ui_state = APP_UI_STATE_READY;
+                ui_status_set_idle();
+            }
             note_activity();
             break;
         case APP_EVENT_BLE_DISCONNECTED:
-            s_recording = false;
             s_ota_updating = false;
-            s_app_ui_state = APP_UI_STATE_READY;
             stop_host_response_timer();
-            audio_pipeline_stop();
-            release_recording_pm_locks();
             release_ota_pm_locks();
-            ui_status_set_pairing(voice_ble_device_name());
+            if (s_recording) {
+                s_app_ui_state = APP_UI_STATE_RECORDING;
+                ui_status_set_recording(audio_pipeline_session_id());
+                ESP_LOGI(TAG, "BLE disconnected; local recording continues");
+            } else {
+                s_app_ui_state = APP_UI_STATE_READY;
+                ui_status_set_pairing(voice_ble_device_name());
+            }
+            break;
+        case APP_EVENT_AUDIO_ERROR:
+            ESP_LOGE(TAG, "local recording failed: %s", esp_err_to_name(event.error));
+            s_recording = false;
+            s_primary_down_us = 0;
+            s_primary_session_id = 0;
+            release_recording_pm_locks();
+            restart_display_dim_timer();
+            restart_deep_sleep_timer();
+            s_app_ui_state = APP_UI_STATE_ERROR;
+            ui_status_set_error("Recording failed");
             break;
         case APP_EVENT_POWER_IRQ:
             gpio_intr_enable(STICK_S3_PIN_PMIC_IRQ);
@@ -969,10 +1019,10 @@ void app_main(void)
     voice_ble_set_ota_callback(ble_ota_cb);
     ESP_ERROR_CHECK(init_buttons());
 
-    esp_err_t err = voice_ble_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "BLE init failed: %s", esp_err_to_name(err));
-        ui_status_set_error("BLE init failed");
+    esp_err_t ble_err = voice_ble_init();
+    if (ble_err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE init failed; local recording remains available: %s",
+                 esp_err_to_name(ble_err));
     } else {
         ui_status_set_device_name(voice_ble_device_name());
     }
@@ -980,11 +1030,14 @@ void app_main(void)
     esp_err_t audio_err = audio_pipeline_init();
     if (audio_err != ESP_OK) {
         ESP_LOGE(TAG, "audio init failed: %s", esp_err_to_name(audio_err));
+        s_app_ui_state = APP_UI_STATE_ERROR;
         ui_status_set_error("Audio init failed");
-    }
-
-    if (err == ESP_OK) {
-        ui_status_set_pairing(voice_ble_device_name());
+    } else {
+        audio_pipeline_set_error_callback(audio_pipeline_error_cb);
+        apply_interaction_mode(INTERACTION_MODE_CLICK_TO_TALK);
+        if (ble_err == ESP_OK) {
+            ui_status_set_pairing(voice_ble_device_name());
+        }
     }
     ESP_LOGI(TAG, "Voice Stick booted");
 
