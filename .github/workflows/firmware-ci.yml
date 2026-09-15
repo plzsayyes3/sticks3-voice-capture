@@ -1,0 +1,43 @@
+name: Firmware CI
+
+on:
+  pull_request:
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-firmware:
+    name: Build StickS3 firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and enforce OTA slot size
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32s3
+          path: firmware
+          command: |
+            set -euo pipefail
+            idf.py build
+            image="build/voice_stick.bin"
+            test -f "$image"
+            size="$(wc -c < "$image" | tr -d ' ')"
+            limit=$((0x200000))
+            echo "firmware image: ${size} bytes; OTA slot limit: ${limit} bytes"
+            if [ "$size" -ge "$limit" ]; then
+              echo "::error ::firmware image does not fit the 2 MiB OTA slot"
+              exit 1
+            fi
+            idf.py size
