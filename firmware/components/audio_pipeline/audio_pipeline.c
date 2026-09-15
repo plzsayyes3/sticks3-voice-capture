@@ -15,8 +15,8 @@
 #include "hal/i2s_types.h"
 #include "opus.h"
 
+#include "recording_store.h"
 #include "stick_s3_board.h"
-#include "voice_ble.h"
 
 static const char *TAG = "audio_pipeline";
 
@@ -28,29 +28,28 @@ static const char *TAG = "audio_pipeline";
 #define OPUS_MAX_PACKET_SIZE 220
 #define OPUS_COMPLEXITY 1
 
-#define TX_QUEUE_DEPTH 50
-#define TX_RETRY_DELAY_MS 30
-#define TX_MAX_RETRIES 50
-#define TX_DRAIN_TIMEOUT_MS 500
-#define TASK_EXIT_WAIT_MS 800
+#define WRITE_QUEUE_DEPTH 50
+#define TASK_EXIT_WAIT_MS 5000
+#define WRITER_POLL_MS 100
 
 typedef struct {
-    uint32_t session_id;
     uint32_t seq;
-    uint8_t  flags;
     uint16_t len;
-    uint8_t  data[OPUS_MAX_PACKET_SIZE];
+    uint8_t data[OPUS_MAX_PACKET_SIZE];
 } audio_packet_t;
 
 static atomic_bool s_running;
+static atomic_bool s_failed;
+static atomic_int s_last_error;
 static bool s_initialized;
 static uint32_t s_session_id;
 static uint32_t s_seq;
 static TaskHandle_t s_audio_task;
-static TaskHandle_t s_tx_task;
-static QueueHandle_t s_tx_queue;
+static TaskHandle_t s_writer_task;
+static QueueHandle_t s_write_queue;
+static audio_pipeline_error_callback_t s_error_callback;
 
-/* Per-session resources: created on start, destroyed on stop */
+/* Per-session resources: created on start, destroyed after writer finalization. */
 static i2s_chan_handle_t s_rx_handle;
 static esp_codec_dev_handle_t s_codec;
 static const audio_codec_ctrl_if_t *s_ctrl_if;
@@ -61,7 +60,7 @@ static OpusEncoder *s_opus_encoder;
 
 static bool tasks_exited(void)
 {
-    return s_audio_task == NULL && s_tx_task == NULL;
+    return s_audio_task == NULL && s_writer_task == NULL;
 }
 
 static esp_err_t wait_for_tasks_to_exit(TickType_t timeout_ticks)
@@ -69,13 +68,29 @@ static esp_err_t wait_for_tasks_to_exit(TickType_t timeout_ticks)
     TickType_t deadline = xTaskGetTickCount() + timeout_ticks;
     while (!tasks_exited()) {
         if (xTaskGetTickCount() >= deadline) {
-            ESP_LOGW(TAG, "tasks still exiting: audio=%p tx=%p",
-                     s_audio_task, s_tx_task);
+            ESP_LOGE(TAG, "tasks did not exit: audio=%p writer=%p",
+                     s_audio_task, s_writer_task);
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     return ESP_OK;
+}
+
+static void report_failure(esp_err_t error, const char *reason)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_failed, &expected, true)) {
+        return;
+    }
+
+    atomic_store(&s_last_error, (int)error);
+    atomic_store(&s_running, false);
+    ESP_LOGE(TAG, "recording failure: %s (%s)", reason, esp_err_to_name(error));
+
+    if (s_error_callback) {
+        s_error_callback(error);
+    }
 }
 
 static esp_err_t init_i2s(void)
@@ -113,7 +128,8 @@ static esp_err_t init_i2s(void)
 static esp_err_t init_codec(void)
 {
     i2c_master_bus_handle_t i2c_bus = stick_s3_board_i2c_bus();
-    ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "i2c bus unavailable");
+    ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "i2c bus unavailable");
 
     audio_codec_i2c_cfg_t i2c_cfg = {
         .port = I2C_NUM_1,
@@ -121,7 +137,8 @@ static esp_err_t init_codec(void)
         .bus_handle = i2c_bus,
     };
     s_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    ESP_RETURN_ON_FALSE(s_ctrl_if != NULL, ESP_ERR_NO_MEM, TAG, "create codec i2c ctrl");
+    ESP_RETURN_ON_FALSE(s_ctrl_if != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create codec i2c ctrl");
 
     audio_codec_i2s_cfg_t i2s_cfg = {
         .port = I2S_NUM_1,
@@ -129,10 +146,12 @@ static esp_err_t init_codec(void)
         .tx_handle = NULL,
     };
     s_data_if = audio_codec_new_i2s_data(&i2s_cfg);
-    ESP_RETURN_ON_FALSE(s_data_if != NULL, ESP_ERR_NO_MEM, TAG, "create codec i2s data");
+    ESP_RETURN_ON_FALSE(s_data_if != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create codec i2s data");
 
     s_gpio_if = audio_codec_new_gpio();
-    ESP_RETURN_ON_FALSE(s_gpio_if != NULL, ESP_ERR_NO_MEM, TAG, "create codec gpio");
+    ESP_RETURN_ON_FALSE(s_gpio_if != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create codec gpio");
 
     es8311_codec_cfg_t es8311_cfg = {
         .ctrl_if = s_ctrl_if,
@@ -151,7 +170,8 @@ static esp_err_t init_codec(void)
         },
     };
     s_codec_if = es8311_codec_new(&es8311_cfg);
-    ESP_RETURN_ON_FALSE(s_codec_if != NULL, ESP_ERR_NO_MEM, TAG, "create es8311");
+    ESP_RETURN_ON_FALSE(s_codec_if != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create es8311");
 
     esp_codec_dev_cfg_t dev_cfg = {
         .dev_type = ESP_CODEC_DEV_TYPE_IN,
@@ -159,7 +179,8 @@ static esp_err_t init_codec(void)
         .data_if = s_data_if,
     };
     s_codec = esp_codec_dev_new(&dev_cfg);
-    ESP_RETURN_ON_FALSE(s_codec != NULL, ESP_ERR_NO_MEM, TAG, "create codec dev");
+    ESP_RETURN_ON_FALSE(s_codec != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create codec dev");
 
     esp_codec_dev_sample_info_t sample_cfg = {
         .bits_per_sample = I2S_DATA_BIT_WIDTH_16BIT,
@@ -182,6 +203,7 @@ static esp_err_t init_opus(void)
                                          OPUS_APPLICATION_VOIP, &error);
     ESP_RETURN_ON_FALSE(s_opus_encoder != NULL && error == OPUS_OK,
                         ESP_FAIL, TAG, "create opus encoder error=%d", error);
+
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_VBR(0));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_BITRATE(OPUS_BITRATE));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_DTX(0));
@@ -226,7 +248,6 @@ static void deinit_codec(void)
 static void deinit_i2s(void)
 {
     if (s_rx_handle) {
-        /* Channel is already disabled by codec close; just release it. */
         i2s_del_channel(s_rx_handle);
         s_rx_handle = NULL;
     }
@@ -243,141 +264,102 @@ static void deinit_session_resources(void)
 static void audio_task(void *arg)
 {
     (void)arg;
+
     int16_t mono[AUDIO_FRAME_SAMPLES];
     uint8_t opus_buf[OPUS_MAX_PACKET_SIZE];
-    uint32_t enqueued = 0;
-    uint32_t dropped = 0;
+    uint32_t encoded_packets = 0;
 
     while (atomic_load(&s_running)) {
         esp_err_t err = esp_codec_dev_read(s_codec, mono, sizeof(mono));
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "codec read failed: %s", esp_err_to_name(err));
-            continue;
+            report_failure(err, "codec read failed");
+            break;
         }
 
-        opus_int32 encoded = opus_encode(s_opus_encoder, mono, AUDIO_FRAME_SAMPLES,
-                                         opus_buf, sizeof(opus_buf));
+        opus_int32 encoded = opus_encode(s_opus_encoder,
+                                         mono,
+                                         AUDIO_FRAME_SAMPLES,
+                                         opus_buf,
+                                         sizeof(opus_buf));
         if (encoded < 0) {
-            ESP_LOGE(TAG, "opus encode failed: %d", (int)encoded);
-            continue;
+            report_failure(ESP_FAIL, "Opus encode failed");
+            break;
         }
 
-        audio_packet_t pkt = {
-            .session_id = s_session_id,
+        audio_packet_t packet = {
             .seq = s_seq,
-            .flags = (s_seq == 0) ? VOICE_BLE_FLAG_START : 0x00,
             .len = (uint16_t)encoded,
         };
-        memcpy(pkt.data, opus_buf, encoded);
+        memcpy(packet.data, opus_buf, (size_t)encoded);
 
-        if (xQueueSend(s_tx_queue, &pkt, 0) == pdTRUE) {
-            s_seq++;
-            enqueued++;
-        } else {
-            /* Queue full: drop oldest packet to make room */
-            audio_packet_t discard;
-            xQueueReceive(s_tx_queue, &discard, 0);
-            xQueueSend(s_tx_queue, &pkt, 0);
-            s_seq++;
-            enqueued++;
-            dropped++;
-            if (dropped == 1 || (dropped % 20) == 0) {
-                ESP_LOGW(TAG, "tx queue overflow, dropped oldest (total=%" PRIu32 ")", dropped);
-            }
+        if (xQueueSend(s_write_queue, &packet, 0) != pdTRUE) {
+            report_failure(ESP_ERR_TIMEOUT,
+                           "Flash writer queue full; refusing silent packet loss");
+            break;
         }
+
+        s_seq++;
+        encoded_packets++;
     }
 
-    ESP_LOGI(TAG, "audio task exit: enqueued=%" PRIu32 " overflow_drops=%" PRIu32,
-             enqueued, dropped);
+    ESP_LOGI(TAG, "audio task exit: encoded=%" PRIu32, encoded_packets);
     s_audio_task = NULL;
     vTaskDelete(NULL);
 }
 
-static void tx_task(void *arg)
+static void writer_task(void *arg)
 {
     (void)arg;
-    audio_packet_t pkt;
-    uint32_t sent = 0;
-    uint32_t tx_dropped = 0;
+
+    audio_packet_t packet;
+    uint32_t written_packets = 0;
 
     while (true) {
-        if (xQueueReceive(s_tx_queue, &pkt, portMAX_DELAY) != pdTRUE) {
+        if (atomic_load(&s_failed)) {
+            break;
+        }
+
+        if (xQueueReceive(s_write_queue, &packet,
+                          pdMS_TO_TICKS(WRITER_POLL_MS)) == pdTRUE) {
+            esp_err_t err = recording_store_write_opus(packet.data,
+                                                       packet.len,
+                                                       AUDIO_FRAME_SAMPLES);
+            if (err != ESP_OK) {
+                report_failure(err, "Flash/Ogg write failed");
+                break;
+            }
+            written_packets++;
             continue;
         }
 
-        /* Sentinel: END flag with no payload signals drain mode */
-        if (pkt.flags == VOICE_BLE_FLAG_END && pkt.len == 0) {
-            goto drain;
-        }
-
-        int retries = 0;
-        while (true) {
-            esp_err_t err = voice_ble_send_audio(pkt.session_id, pkt.seq,
-                                                 pkt.flags, pkt.data, pkt.len);
-            if (err == ESP_OK) {
-                sent++;
-                break;
-            }
-            retries++;
-            if (retries >= TX_MAX_RETRIES) {
-                tx_dropped++;
-                if (tx_dropped == 1 || (tx_dropped % 20) == 0) {
-                    ESP_LOGW(TAG, "tx failed after %d retries seq=%" PRIu32
-                             " (total_dropped=%" PRIu32 ")",
-                             TX_MAX_RETRIES, pkt.seq, tx_dropped);
-                }
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(TX_RETRY_DELAY_MS));
+        if (!atomic_load(&s_running) &&
+            s_audio_task == NULL &&
+            uxQueueMessagesWaiting(s_write_queue) == 0) {
+            break;
         }
     }
 
-drain:
-    {
-        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(TX_DRAIN_TIMEOUT_MS);
-        while (xQueueReceive(s_tx_queue, &pkt, 0) == pdTRUE) {
-            if (pkt.flags == VOICE_BLE_FLAG_END && pkt.len == 0) {
-                break;
-            }
-            if (xTaskGetTickCount() >= deadline) {
-                UBaseType_t remaining = uxQueueMessagesWaiting(s_tx_queue);
-                if (remaining > 0) {
-                    ESP_LOGW(TAG, "drain timeout, discarding %u packets",
-                             (unsigned)remaining);
-                }
-                xQueueReset(s_tx_queue);
-                break;
-            }
-            int retries = 0;
-            while (true) {
-                esp_err_t err = voice_ble_send_audio(pkt.session_id, pkt.seq,
-                                                     pkt.flags, pkt.data, pkt.len);
-                if (err == ESP_OK) {
-                    sent++;
-                    break;
-                }
-                retries++;
-                if (retries >= TX_MAX_RETRIES || xTaskGetTickCount() >= deadline) {
-                    tx_dropped++;
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(TX_RETRY_DELAY_MS));
-            }
+    if (atomic_load(&s_failed)) {
+        xQueueReset(s_write_queue);
+        recording_store_abort(true);
+    } else {
+        long final_size = 0;
+        esp_err_t err = recording_store_finish(&final_size);
+        if (err != ESP_OK) {
+            report_failure(err, "recording finalization failed");
+        } else {
+            ESP_LOGI(TAG, "recording saved: packets=%" PRIu32 " size=%ld",
+                     written_packets, final_size);
         }
-
-        /* Send the END marker over BLE */
-        voice_ble_send_audio(s_session_id, s_seq, VOICE_BLE_FLAG_END, NULL, 0);
-
-        ESP_LOGI(TAG, "tx task exit: sent=%" PRIu32 " dropped=%" PRIu32, sent, tx_dropped);
-
-        /* Wait for audio_task to finish before destroying shared resources */
-        while (s_audio_task != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        deinit_session_resources();
-        s_tx_task = NULL;
-        vTaskDelete(NULL);
     }
+
+    while (s_audio_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    deinit_session_resources();
+    s_writer_task = NULL;
+    vTaskDelete(NULL);
 }
 
 esp_err_t audio_pipeline_init(void)
@@ -386,30 +368,43 @@ esp_err_t audio_pipeline_init(void)
         return ESP_OK;
     }
 
-    s_tx_queue = xQueueCreate(TX_QUEUE_DEPTH, sizeof(audio_packet_t));
-    ESP_RETURN_ON_FALSE(s_tx_queue != NULL, ESP_ERR_NO_MEM, TAG, "create tx queue");
+    ESP_RETURN_ON_ERROR(recording_store_init(), TAG, "recording store init");
 
+    s_write_queue = xQueueCreate(WRITE_QUEUE_DEPTH, sizeof(audio_packet_t));
+    ESP_RETURN_ON_FALSE(s_write_queue != NULL, ESP_ERR_NO_MEM, TAG,
+                        "create write queue");
+
+    atomic_store(&s_running, false);
+    atomic_store(&s_failed, false);
+    atomic_store(&s_last_error, ESP_OK);
     s_initialized = true;
-    ESP_LOGI(TAG, "audio pipeline ready (resources allocated on demand)");
+    ESP_LOGI(TAG, "audio pipeline ready for local recording");
     return ESP_OK;
+}
+
+void audio_pipeline_set_error_callback(audio_pipeline_error_callback_t callback)
+{
+    s_error_callback = callback;
 }
 
 esp_err_t audio_pipeline_start(uint32_t session_id)
 {
-    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "not initialized");
-    if (atomic_load(&s_running)) {
-        return ESP_OK;
-    }
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG,
+                        "not initialized");
+    ESP_RETURN_ON_FALSE(!atomic_load(&s_running), ESP_ERR_INVALID_STATE, TAG,
+                        "already recording");
     ESP_RETURN_ON_ERROR(wait_for_tasks_to_exit(pdMS_TO_TICKS(TASK_EXIT_WAIT_MS)),
                         TAG, "wait previous session exit");
 
     ESP_RETURN_ON_ERROR(init_i2s(), TAG, "i2s init");
+
     esp_err_t err = init_codec();
     if (err != ESP_OK) {
         deinit_i2s();
         ESP_LOGE(TAG, "codec init: %s", esp_err_to_name(err));
         return err;
     }
+
     err = init_opus();
     if (err != ESP_OK) {
         deinit_codec();
@@ -418,60 +413,90 @@ esp_err_t audio_pipeline_start(uint32_t session_id)
         return err;
     }
 
-    voice_ble_request_fast_interval();
+    int lookahead = 0;
+    if (opus_encoder_ctl(s_opus_encoder, OPUS_GET_LOOKAHEAD(&lookahead)) != OPUS_OK) {
+        lookahead = 0;
+    }
+    uint32_t scaled_pre_skip = ((uint32_t)lookahead * 48000U) / AUDIO_SAMPLE_RATE;
+    if (scaled_pre_skip > UINT16_MAX) {
+        scaled_pre_skip = UINT16_MAX;
+    }
 
-    xQueueReset(s_tx_queue);
+    err = recording_store_begin(session_id,
+                                AUDIO_SAMPLE_RATE,
+                                (uint16_t)scaled_pre_skip);
+    if (err != ESP_OK) {
+        deinit_session_resources();
+        ESP_LOGE(TAG, "open recording: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    xQueueReset(s_write_queue);
     s_session_id = session_id;
     s_seq = 0;
     opus_encoder_ctl(s_opus_encoder, OPUS_RESET_STATE);
+    atomic_store(&s_failed, false);
+    atomic_store(&s_last_error, ESP_OK);
     atomic_store(&s_running, true);
 
-    BaseType_t ok = xTaskCreatePinnedToCore(tx_task, "audio_tx", 4096,
-                                            NULL, 6, &s_tx_task, 0);
+    BaseType_t ok = xTaskCreatePinnedToCore(audio_task,
+                                            "audio_capture",
+                                            32768,
+                                            NULL,
+                                            5,
+                                            &s_audio_task,
+                                            1);
     if (ok != pdPASS) {
         atomic_store(&s_running, false);
-        s_tx_task = NULL;
+        s_audio_task = NULL;
+        recording_store_abort(false);
         deinit_session_resources();
         return ESP_ERR_NO_MEM;
     }
 
-    ok = xTaskCreatePinnedToCore(audio_task, "audio_pipeline", 32768,
-                                 NULL, 5, &s_audio_task, 1);
+    ok = xTaskCreatePinnedToCore(writer_task,
+                                 "record_writer",
+                                 6144,
+                                 NULL,
+                                 6,
+                                 &s_writer_task,
+                                 0);
     if (ok != pdPASS) {
         atomic_store(&s_running, false);
-        s_audio_task = NULL;
-        audio_packet_t sentinel = {
-            .session_id = s_session_id,
-            .seq = s_seq,
-            .flags = VOICE_BLE_FLAG_END,
-            .len = 0,
-        };
-        xQueueSend(s_tx_queue, &sentinel, portMAX_DELAY);
         (void)wait_for_tasks_to_exit(pdMS_TO_TICKS(TASK_EXIT_WAIT_MS));
-        /* tx_task cleans up session resources on exit */
+        xQueueReset(s_write_queue);
+        recording_store_abort(false);
+        deinit_session_resources();
+        s_writer_task = NULL;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "start session %" PRIu32, session_id);
+
+    ESP_LOGI(TAG, "start local recording session=%" PRIu32 " path=%s",
+             session_id, recording_store_current_path());
     return ESP_OK;
 }
 
 esp_err_t audio_pipeline_stop(void)
 {
-    if (!atomic_load(&s_running)) {
-        return ESP_OK;
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
     }
-    atomic_store(&s_running, false);
-    ESP_LOGI(TAG, "stop session %" PRIu32, s_session_id);
 
-    /* Send sentinel to trigger tx_task drain and exit */
-    audio_packet_t sentinel = {
-        .session_id = s_session_id,
-        .seq = s_seq,
-        .flags = VOICE_BLE_FLAG_END,
-        .len = 0,
-    };
-    xQueueSend(s_tx_queue, &sentinel, portMAX_DELAY);
-    return ESP_OK;
+    if (!tasks_exited()) {
+        atomic_store(&s_running, false);
+        ESP_LOGI(TAG, "stop session %" PRIu32 "; draining writer", s_session_id);
+        esp_err_t wait_err = wait_for_tasks_to_exit(pdMS_TO_TICKS(TASK_EXIT_WAIT_MS));
+        if (wait_err != ESP_OK) {
+            return wait_err;
+        }
+    }
+
+    return (esp_err_t)atomic_load(&s_last_error);
+}
+
+esp_err_t audio_pipeline_last_error(void)
+{
+    return (esp_err_t)atomic_load(&s_last_error);
 }
 
 uint32_t audio_pipeline_session_id(void)
