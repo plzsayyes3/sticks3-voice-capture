@@ -57,8 +57,13 @@ milestone is verified on the device.
 
 1. Build the firmware and confirm the final application image still fits each
    2 MiB OTA slot.
-2. USB-flash the partition table and firmware once; an app-only OTA cannot move
-   existing partition boundaries.
+2. For the **first development install of this new partition layout**, perform a
+   clean USB install (`idf.py erase-flash` followed by `idf.py flash`). The new
+   FAT partition overlaps bytes that previously belonged to VoiceStick's larger
+   `ota_1` and SPIFFS layout, so simply writing the new partition table can leave
+   nonblank old data in the new recording region. The recorder intentionally
+   refuses to auto-format a nonblank partition because that could destroy real
+   recordings on later boots.
 3. Boot with BLE unavailable and verify the recording FAT partition mounts.
 4. Record 10–30 seconds with the front button, stop, and confirm an `.ogg` file
    is finalized.
@@ -70,6 +75,10 @@ milestone is verified on the device.
 8. During another recording, force reset/power loss after several seconds;
    verify a `.part` remains and all earlier `.ogg` files are unchanged.
 9. Only after the above passes, begin side-button Wi-Fi Sync work.
+
+A production migration path that preserves recordings across partition-layout
+changes is a separate problem. Do not use `erase-flash` once the device contains
+recordings that need to be kept.
 
 ## Flash layout and OTA
 
