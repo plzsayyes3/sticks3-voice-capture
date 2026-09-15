@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_random.h"
 
 esp_err_t recording_store_init(void);
 esp_err_t recording_store_begin(uint32_t session_id,
