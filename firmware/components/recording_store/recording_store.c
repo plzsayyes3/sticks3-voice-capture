@@ -281,24 +281,23 @@ esp_err_t recording_store_init(void)
         return ESP_OK;
     }
 
+    const bool blank_partition = storage_partition_is_blank();
     esp_vfs_fat_mount_config_t config = {
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = blank_partition,
         .max_files = STORAGE_MAX_FILES,
         .allocation_unit_size = STORAGE_ALLOCATION_UNIT,
     };
 
-    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
-        STORAGE_BASE_PATH, STORAGE_LABEL, &config, &s_wl_handle);
-
-    if (err != ESP_OK && storage_partition_is_blank()) {
-        ESP_LOGW(TAG, "blank storage partition detected; formatting FAT filesystem once");
-        config.format_if_mount_failed = true;
-        err = esp_vfs_fat_spiflash_mount_rw_wl(
-            STORAGE_BASE_PATH, STORAGE_LABEL, &config, &s_wl_handle);
+    if (blank_partition) {
+        ESP_LOGW(TAG, "blank recording partition detected; first mount may format FAT");
     }
 
+    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
+        STORAGE_BASE_PATH, STORAGE_LABEL, &config, &s_wl_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mount storage failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG,
+                 "mount storage failed without destructive retry: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
