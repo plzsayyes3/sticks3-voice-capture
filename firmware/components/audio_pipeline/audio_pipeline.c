@@ -413,7 +413,7 @@ esp_err_t audio_pipeline_start(uint32_t session_id)
         return err;
     }
 
-    int lookahead = 0;
+    opus_int32 lookahead = 0;
     if (opus_encoder_ctl(s_opus_encoder, OPUS_GET_LOOKAHEAD(&lookahead)) != OPUS_OK) {
         lookahead = 0;
     }
@@ -497,9 +497,4 @@ esp_err_t audio_pipeline_stop(void)
 esp_err_t audio_pipeline_last_error(void)
 {
     return (esp_err_t)atomic_load(&s_last_error);
-}
-
-uint32_t audio_pipeline_session_id(void)
-{
-    return s_session_id;
 }
