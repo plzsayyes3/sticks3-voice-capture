@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -182,7 +183,7 @@ static void recording_id_from_filename(const char *name, char *out, size_t out_s
     out[id_len] = '\0';
 }
 
-static esp_err_t upload_file(const char *path, const char *recording_id)
+static esp_err_t upload_file(const char *path, const char *recording_id, const char *base_url)
 {
     FILE *file = fopen(path, "rb");
     if (!file) {
@@ -199,7 +200,7 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
     }
 
     char url[PATH_BUFFER_SIZE];
-    snprintf(url, sizeof(url), "%s/v1/recordings", STICKS3_RECEIVER_URL);
+    snprintf(url, sizeof(url), "%s/v1/recordings", base_url);
     char auth_header[160];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", STICKS3_DEVICE_TOKEN);
 
@@ -207,6 +208,11 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 20000,
+        /* Only exercised for the https:// fallback URL (Tailscale Funnel);
+         * a no-op for the plain http:// LAN URL. Needed to verify the
+         * Funnel endpoint's Let's Encrypt cert against ESP-IDF's bundled
+         * Mozilla root CA set (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y). */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -344,7 +350,18 @@ static void sync_pending_recordings(void)
         char recording_id[PATH_BUFFER_SIZE];
         recording_id_from_filename(candidates->pending[i], recording_id, sizeof(recording_id));
 
-        if (upload_file(full_path, recording_id) == ESP_OK) {
+        /* Try the LAN (mDNS hostname, plain HTTP, no internet round-trip)
+         * first since it's faster and keeps the audio on-network; fall
+         * back to the Tailscale Funnel URL (HTTPS, public) only if that
+         * fails — e.g. the device is away from home and mDNS can't
+         * resolve, or the Mac is unreachable on the LAN for any reason. */
+        esp_err_t upload_err = upload_file(full_path, recording_id, STICKS3_RECEIVER_URL);
+        if (upload_err != ESP_OK) {
+            ESP_LOGW(TAG, "LAN upload failed for %s, trying fallback URL", candidates->pending[i]);
+            upload_err = upload_file(full_path, recording_id, STICKS3_RECEIVER_URL_FALLBACK);
+        }
+
+        if (upload_err == ESP_OK) {
             /* The receiver fsyncs the recording durably and dedupes by
              * SHA-256 before replying 200/201, so a success response means
              * the recording is safe on the Mac. Delete rather than rename
