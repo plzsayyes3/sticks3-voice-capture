@@ -983,7 +983,11 @@ static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsig
         break;
     }
     ESP_LOGI(TAG, "wifi sync result: %s (uploaded=%u failed=%u)", hint, uploaded, failed);
-    ui_status_set_syncing(hint);
+    if (result == WIFI_SYNC_RESULT_OK) {
+        ui_status_set_sync_success(hint);
+    } else {
+        ui_status_set_syncing(hint);
+    }
 
     if (s_sync_result_display_timer) {
         (void)esp_timer_stop(s_sync_result_display_timer);

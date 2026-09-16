@@ -500,6 +500,12 @@ void ui_status_set_syncing(const char *hint)
     set_scene(UI_STATUS_ICON_PAIRING, "Sync", hint ? hint : "");
 }
 
+void ui_status_set_sync_success(const char *hint)
+{
+    ESP_LOGD(TAG, "sync success: %s", hint ? hint : "");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Success", hint ? hint : "");
+}
+
 void ui_status_set_ota_progress(uint32_t written, uint32_t size)
 {
     char hint[32];
