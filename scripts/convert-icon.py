@@ -35,7 +35,19 @@ def convert(src_path: str, name: str) -> Path:
 
     img = Image.open(src_path).convert("RGBA")
     if img.size != (ICON_SIZE, ICON_SIZE):
-        img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+        # Resize to fit within ICON_SIZE x ICON_SIZE preserving aspect ratio,
+        # then center on a transparent ICON_SIZE x ICON_SIZE canvas. A plain
+        # .resize() to (ICON_SIZE, ICON_SIZE) stretches non-square source
+        # images non-uniformly (e.g. a 1000x1573 portrait source came out
+        # visibly squashed horizontally on-device).
+        src_w, src_h = img.size
+        scale = min(ICON_SIZE / src_w, ICON_SIZE / src_h)
+        fit_w = max(1, round(src_w * scale))
+        fit_h = max(1, round(src_h * scale))
+        resized = img.resize((fit_w, fit_h), Image.LANCZOS)
+        canvas = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+        canvas.paste(resized, ((ICON_SIZE - fit_w) // 2, (ICON_SIZE - fit_h) // 2), resized)
+        img = canvas
 
     r, g, b, a = img.split()
     bgra = Image.merge("RGBA", (b, g, r, a))
