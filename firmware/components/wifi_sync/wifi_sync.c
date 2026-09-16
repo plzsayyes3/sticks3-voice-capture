@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -25,6 +26,16 @@ static const char *TAG = "wifi_sync";
 #define UPLOAD_CHUNK_SIZE 4096
 #define SENT_SUFFIX ".sent"
 #define PATH_BUFFER_SIZE 320
+/* Recording filenames are "<8-hex-id>-<8-hex-suffix>.ogg" (~22 bytes) or
+ * that plus SENT_SUFFIX; 40 leaves comfortable margin without the bloat of
+ * reusing PATH_BUFFER_SIZE (sized for a full URL) per entry. */
+#define SYNC_FILENAME_BUFFER_SIZE 40
+/* Bounds the scratch array so the directory listing can be collected in one
+ * pass (see collect_sync_candidates) instead of mutating entries while
+ * readdir() is still iterating the directory, which is unsafe on FATFS
+ * (entries can be skipped or re-visited). 48 is far above what the
+ * ~3.94MB storage partition holds at typical recording sizes. */
+#define MAX_SYNC_CANDIDATES 48
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -149,6 +160,15 @@ static bool is_pending_recording(const char *name)
     return has_suffix(name, ".ogg") && !has_suffix(name, SENT_SUFFIX);
 }
 
+/* Recordings synced by firmware before this change were left behind as
+ * "<id>.ogg.sent" (renamed, never deleted) and would otherwise sit on the
+ * ~3.94MB storage partition forever. These are already confirmed uploaded
+ * by definition of having been renamed, so sync can just clear them out. */
+static bool is_stale_sent_file(const char *name)
+{
+    return has_suffix(name, SENT_SUFFIX);
+}
+
 /* "00000002-8dbbe763.ogg" -> "00000002-8dbbe763" */
 static void recording_id_from_filename(const char *name, char *out, size_t out_size)
 {
@@ -245,45 +265,105 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
     return ESP_OK;
 }
 
-static void sync_pending_recordings(void)
+/* Two-pass sync: collect filenames first (readdir only), then act on them
+ * (upload/delete) after closing the directory. Renaming or deleting entries
+ * while readdir() is still walking the same directory is unsafe on FATFS —
+ * the traversal can skip or re-visit entries depending on how the directory
+ * cluster chain shifts underneath it. */
+typedef struct {
+    char pending[MAX_SYNC_CANDIDATES][SYNC_FILENAME_BUFFER_SIZE];
+    size_t pending_count;
+    char stale_sent[MAX_SYNC_CANDIDATES][SYNC_FILENAME_BUFFER_SIZE];
+    size_t stale_sent_count;
+} sync_candidates_t;
+
+static void collect_sync_candidates(const char *base_path, sync_candidates_t *out)
 {
-    const char *base_path = recording_store_base_path();
+    memset(out, 0, sizeof(*out));
+
     DIR *dir = opendir(base_path);
     if (!dir) {
         ESP_LOGW(TAG, "cannot open %s for sync", base_path);
         return;
     }
 
-    unsigned uploaded = 0;
-    unsigned failed = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (!is_pending_recording(entry->d_name)) {
-            continue;
-        }
-
-        char full_path[PATH_BUFFER_SIZE];
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, entry->d_name);
-
-        char recording_id[PATH_BUFFER_SIZE];
-        recording_id_from_filename(entry->d_name, recording_id, sizeof(recording_id));
-
-        if (upload_file(full_path, recording_id) == ESP_OK) {
-            char sent_path[PATH_BUFFER_SIZE + sizeof(SENT_SUFFIX)];
-            snprintf(sent_path, sizeof(sent_path), "%s%s", full_path, SENT_SUFFIX);
-            if (rename(full_path, sent_path) != 0) {
-                ESP_LOGW(TAG, "uploaded %s but rename to .sent failed; will retry next sync",
-                         entry->d_name);
+        if (is_pending_recording(entry->d_name)) {
+            if (out->pending_count < MAX_SYNC_CANDIDATES) {
+                strlcpy(out->pending[out->pending_count], entry->d_name, SYNC_FILENAME_BUFFER_SIZE);
+                out->pending_count++;
+            } else {
+                ESP_LOGW(TAG, "sync: more than %u pending recordings; %s will sync next time",
+                         (unsigned)MAX_SYNC_CANDIDATES, entry->d_name);
             }
-            uploaded++;
-        } else {
-            ESP_LOGW(TAG, "upload failed for %s; left on device for retry", entry->d_name);
-            failed++;
+        } else if (is_stale_sent_file(entry->d_name)) {
+            if (out->stale_sent_count < MAX_SYNC_CANDIDATES) {
+                strlcpy(out->stale_sent[out->stale_sent_count], entry->d_name, SYNC_FILENAME_BUFFER_SIZE);
+                out->stale_sent_count++;
+            }
         }
     }
     closedir(dir);
+}
 
-    ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed", uploaded, failed);
+static void sync_pending_recordings(void)
+{
+    const char *base_path = recording_store_base_path();
+
+    /* Heap-allocated and freed within this call rather than static/global:
+     * a static sync_candidates_t here would permanently reserve ~3.8KB of
+     * internal RAM for the firmware's whole lifetime just for the rare
+     * moments a sync runs — the same class of internal-RAM pressure that
+     * caused the ESP_ERR_NO_MEM regression this project already hit once
+     * (see canonical doc). Sync only ever runs outside of active recording,
+     * so a transient allocation here is safe. */
+    sync_candidates_t *candidates = malloc(sizeof(sync_candidates_t));
+    if (!candidates) {
+        ESP_LOGE(TAG, "sync: out of memory collecting candidates");
+        return;
+    }
+    collect_sync_candidates(base_path, candidates);
+
+    for (size_t i = 0; i < candidates->stale_sent_count; ++i) {
+        char full_path[PATH_BUFFER_SIZE];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->stale_sent[i]);
+        if (remove(full_path) != 0) {
+            ESP_LOGW(TAG, "failed to clear stale synced file %s", candidates->stale_sent[i]);
+        } else {
+            ESP_LOGI(TAG, "cleared stale synced file %s", candidates->stale_sent[i]);
+        }
+    }
+
+    unsigned uploaded = 0;
+    unsigned failed = 0;
+    for (size_t i = 0; i < candidates->pending_count; ++i) {
+        char full_path[PATH_BUFFER_SIZE];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->pending[i]);
+
+        char recording_id[PATH_BUFFER_SIZE];
+        recording_id_from_filename(candidates->pending[i], recording_id, sizeof(recording_id));
+
+        if (upload_file(full_path, recording_id) == ESP_OK) {
+            /* The receiver fsyncs the recording durably and dedupes by
+             * SHA-256 before replying 200/201, so a success response means
+             * the recording is safe on the Mac. Delete rather than rename
+             * to .sent: the storage partition is only ~3.94MB, and files
+             * that are merely renamed never free that space. */
+            if (remove(full_path) != 0) {
+                ESP_LOGW(TAG, "uploaded %s but delete failed; will retry next sync",
+                         candidates->pending[i]);
+            }
+            uploaded++;
+        } else {
+            ESP_LOGW(TAG, "upload failed for %s; left on device for retry", candidates->pending[i]);
+            failed++;
+        }
+    }
+
+    ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed, %u stale .sent cleared",
+             uploaded, failed, (unsigned)candidates->stale_sent_count);
+    free(candidates);
 }
 
 static void wifi_sync_task(void *arg)
