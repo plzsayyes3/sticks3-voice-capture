@@ -264,7 +264,7 @@ static void stop_host_response_timer(void)
 
 static void enter_deep_sleep(void)
 {
-    if (s_recording || s_ota_updating || voice_ble_ota_is_active()) {
+    if (s_recording || s_ota_updating || voice_ble_ota_is_active() || wifi_sync_is_running()) {
         restart_deep_sleep_timer();
         return;
     }
@@ -362,10 +362,11 @@ static uint32_t start_recording(void)
     const bool ble_ready = voice_ble_is_ready();
     const bool ota_active = voice_ble_ota_is_active();
     const bool ui_allows_start = app_ui_allows_recording_start();
-    if (s_recording || s_ota_updating || ota_active || !ui_allows_start) {
+    const bool sync_active = wifi_sync_is_running();
+    if (s_recording || s_ota_updating || ota_active || !ui_allows_start || sync_active) {
         ESP_LOGW(TAG,
-                 "start recording denied: recording=%d ota=%d ble_ota=%d ble_ready=%d ui_state=%d",
-                 s_recording, s_ota_updating, ota_active, ble_ready, s_app_ui_state);
+                 "start recording denied: recording=%d ota=%d ble_ota=%d ble_ready=%d ui_state=%d sync=%d",
+                 s_recording, s_ota_updating, ota_active, ble_ready, s_app_ui_state, sync_active);
         return 0;
     }
 
