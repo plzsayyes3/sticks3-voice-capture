@@ -488,6 +488,12 @@ void ui_status_set_partial_text(const char *text)
     set_scene(UI_STATUS_ICON_TRANSCRIBING, "Thinking", text ? text : "");
 }
 
+void ui_status_set_capacity(const char *text)
+{
+    ESP_LOGD(TAG, "capacity: %s", text ? text : "");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Storage", text ? text : "");
+}
+
 void ui_status_set_ota_progress(uint32_t written, uint32_t size)
 {
     char hint[32];

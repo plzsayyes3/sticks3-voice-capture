@@ -20,6 +20,7 @@
 #include "iot_button.h"
 
 #include "audio_pipeline.h"
+#include "recording_store.h"
 #include "stick_s3_board.h"
 #include "ui_status.h"
 #include "wifi_sync.h"
@@ -35,6 +36,9 @@ static const char *TAG = "voice_stick";
 #define BATTERY_REFRESH_FALLBACK_US (BATTERY_REFRESH_FALLBACK_MS * 1000ULL)
 #define DEEP_SLEEP_TIMEOUT_MS (5 * 60 * 1000)
 #define DEEP_SLEEP_TIMEOUT_US (DEEP_SLEEP_TIMEOUT_MS * 1000ULL)
+#define SIDE_LONG_PRESS_MS 700
+#define CAPACITY_DISPLAY_TIMEOUT_MS (4 * 1000)
+#define CAPACITY_DISPLAY_TIMEOUT_US (CAPACITY_DISPLAY_TIMEOUT_MS * 1000ULL)
 
 static bool s_recording;
 static bool s_ota_updating;
@@ -48,6 +52,7 @@ static esp_timer_handle_t s_display_dim_timer;
 static esp_timer_handle_t s_deep_sleep_timer;
 static esp_timer_handle_t s_battery_refresh_timer;
 static esp_timer_handle_t s_host_response_timer;
+static esp_timer_handle_t s_capacity_display_timer;
 static uint32_t s_session_id = 1;
 static QueueHandle_t s_app_event_queue;
 static button_handle_t s_front_button;
@@ -123,6 +128,7 @@ static void queue_app_event(app_event_type_t type);
 static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, uint32_t size);
 static void queue_ui_state_event(const char *state, const char *text);
 static void apply_interaction_mode(interaction_mode_t mode);
+static void show_storage_capacity(void);
 
 static bool is_external_powered(void)
 {
@@ -698,12 +704,15 @@ static void app_event_task(void *arg)
             note_activity();
             s_secondary_down_us = esp_timer_get_time();
             break;
-        case APP_EVENT_SIDE_UP:
+        case APP_EVENT_SIDE_UP: {
             ESP_LOGI(TAG, "button side up");
             note_activity();
-            voice_ble_send_button_click("secondary", elapsed_button_ms(s_secondary_down_us), 0);
+            const uint32_t secondary_duration_ms = elapsed_button_ms(s_secondary_down_us);
+            voice_ble_send_button_click("secondary", secondary_duration_ms, 0);
             s_secondary_down_us = 0;
-            if (s_recording) {
+            if (secondary_duration_ms >= SIDE_LONG_PRESS_MS) {
+                show_storage_capacity();
+            } else if (s_recording) {
                 ESP_LOGW(TAG, "Sync skipped: recording in progress");
                 ui_status_set_idle_hint("Sync: recording");
             } else if (wifi_sync_is_running()) {
@@ -717,6 +726,7 @@ static void app_event_task(void *arg)
                 }
             }
             break;
+        }
         case APP_EVENT_UI_STATE:
             apply_app_ui_state(event.state, event.text);
             break;
@@ -882,6 +892,49 @@ static esp_err_t init_display_dim_timer(void)
     return esp_timer_create(&timer_args, &s_display_dim_timer);
 }
 
+static void capacity_display_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_recording && !s_ota_updating) {
+        ui_status_set_idle();
+    }
+}
+
+static esp_err_t init_capacity_display_timer(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = capacity_display_timer_cb,
+        .name = "capacity_display",
+    };
+    return esp_timer_create(&timer_args, &s_capacity_display_timer);
+}
+
+static void show_storage_capacity(void)
+{
+    uint64_t used_bytes = 0;
+    uint64_t capacity_bytes = 0;
+    esp_err_t err = recording_store_get_usage(&used_bytes, &capacity_bytes);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "capacity query failed: %s", esp_err_to_name(err));
+        ui_status_set_capacity("Unavailable");
+        return;
+    }
+
+    char text[32];
+    snprintf(text, sizeof(text), "%.1f / %.1f MB",
+             used_bytes / (1024.0 * 1024.0), capacity_bytes / (1024.0 * 1024.0));
+    ESP_LOGI(TAG, "storage capacity: %s", text);
+    ui_status_set_capacity(text);
+
+    if (s_capacity_display_timer) {
+        (void)esp_timer_stop(s_capacity_display_timer);
+        esp_err_t timer_err = esp_timer_start_once(s_capacity_display_timer, CAPACITY_DISPLAY_TIMEOUT_US);
+        if (timer_err != ESP_OK) {
+            ESP_LOGW(TAG, "start capacity display timer failed: %s", esp_err_to_name(timer_err));
+        }
+    }
+}
+
 static void deep_sleep_timer_cb(void *arg)
 {
     (void)arg;
@@ -1032,6 +1085,7 @@ void app_main(void)
     ESP_ERROR_CHECK(stick_s3_board_init());
     ESP_ERROR_CHECK(ui_status_init());
     ESP_ERROR_CHECK(init_display_dim_timer());
+    ESP_ERROR_CHECK(init_capacity_display_timer());
     ESP_ERROR_CHECK(init_deep_sleep_timer());
     ESP_ERROR_CHECK(init_host_response_timer());
     note_activity();
