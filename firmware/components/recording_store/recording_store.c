@@ -275,6 +275,11 @@ static void log_recoverable_partials(void)
     }
 }
 
+const char *recording_store_base_path(void)
+{
+    return STORAGE_BASE_PATH;
+}
+
 esp_err_t recording_store_init(void)
 {
     if (s_mounted) {

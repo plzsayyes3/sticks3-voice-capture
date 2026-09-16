@@ -6,4 +6,4 @@ firmware/sdkconfig.old
 firmware/dependencies.lock
 *.log
 .DS_Store
-firmware/main/secrets.h
+firmware/components/wifi_sync/include/secrets.h

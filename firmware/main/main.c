@@ -21,6 +21,7 @@
 #include "audio_pipeline.h"
 #include "stick_s3_board.h"
 #include "ui_status.h"
+#include "wifi_sync.h"
 #include "voice_ble.h"
 
 static const char *TAG = "voice_stick";
@@ -698,6 +699,19 @@ static void app_event_task(void *arg)
             note_activity();
             voice_ble_send_button_click("secondary", elapsed_button_ms(s_secondary_down_us), 0);
             s_secondary_down_us = 0;
+            if (s_recording) {
+                ESP_LOGW(TAG, "Sync skipped: recording in progress");
+                ui_status_set_idle_hint("Sync: recording");
+            } else if (wifi_sync_is_running()) {
+                ESP_LOGI(TAG, "Sync already in progress");
+            } else {
+                ui_status_set_idle_hint("Wi-Fi Sync...");
+                esp_err_t sync_err = wifi_sync_start();
+                if (sync_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Sync start failed: %s", esp_err_to_name(sync_err));
+                    ui_status_set_idle_hint("Sync unavailable");
+                }
+            }
             break;
         case APP_EVENT_UI_STATE:
             apply_app_ui_state(event.state, event.text);
@@ -1018,6 +1032,12 @@ void app_main(void)
     voice_ble_set_control_callback(ble_control_cb);
     voice_ble_set_ota_callback(ble_ota_cb);
     ESP_ERROR_CHECK(init_buttons());
+
+    esp_err_t wifi_sync_err = wifi_sync_init();
+    if (wifi_sync_err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi Sync init failed; side-button Sync unavailable, local recording unaffected: %s",
+                 esp_err_to_name(wifi_sync_err));
+    }
 
     esp_err_t ble_err = voice_ble_init();
     if (ble_err != ESP_OK) {

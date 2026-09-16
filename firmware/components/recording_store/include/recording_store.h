@@ -8,6 +8,7 @@
 #include "esp_random.h"
 
 esp_err_t recording_store_init(void);
+const char *recording_store_base_path(void);
 esp_err_t recording_store_begin(uint32_t session_id,
                                 uint32_t input_sample_rate,
                                 uint16_t pre_skip_48k);
