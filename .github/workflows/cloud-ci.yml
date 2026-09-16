@@ -1,0 +1,52 @@
+name: Cloud service CI
+
+on:
+  push:
+    paths:
+      - "cloud/**"
+      - ".github/workflows/cloud-ci.yml"
+  pull_request:
+    paths:
+      - "cloud/**"
+      - ".github/workflows/cloud-ci.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: cloud/requirements.txt
+      - name: Install dependencies
+        run: pip install -r cloud/requirements.txt
+      - name: Compile
+        run: python -m py_compile cloud/app.py
+      - name: Basic Flask smoke test
+        env:
+          DEVICE_TOKEN: test-device-token
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "cloud")
+          import app
+
+          client = app.app.test_client()
+          health = client.get("/health")
+          assert health.status_code == 200
+          assert health.json["ok"] is True
+
+          empty = client.post(
+              "/v1/recordings",
+              headers={
+                  "Authorization": "Bearer test-device-token",
+                  "X-Recording-ID": "ci-smoke-001",
+                  "Content-Type": "audio/ogg",
+              },
+              data=b"",
+          )
+          assert empty.status_code == 400
+          assert empty.json["error"] == "empty_body"
+          PY
