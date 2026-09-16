@@ -13,3 +13,4 @@ recording-dump-*/
 local-receiver/.venv/
 local-receiver/.env
 local-receiver/__pycache__/
+scripts/.icon-venv/
