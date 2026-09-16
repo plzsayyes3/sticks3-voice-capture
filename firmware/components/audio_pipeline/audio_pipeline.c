@@ -439,9 +439,24 @@ esp_err_t audio_pipeline_start(uint32_t session_id)
     atomic_store(&s_last_error, ESP_OK);
     atomic_store(&s_running, true);
 
+    /* Stacks must stay in internal RAM, not PSRAM: writer_task calls into
+     * the flash driver (fwrite/fflush/fsync on the FAT-on-flash partition),
+     * which disables the cache across both cores while it runs. ESP-IDF
+     * asserts that no running task's own stack lives in PSRAM at that
+     * point (esp_task_stack_is_sane_cache_disabled), since PSRAM is
+     * unreachable with the cache off — a task stack there would crash
+     * mid-context-switch. Confirmed by a real panic/reboot on-device
+     * (assert failed in spi_flash_disable_interrupts_caches_and_other_cpu)
+     * when this was tried. */
+    /* 28672 rather than a round 32768: by the time BLE/Wi-Fi/netif init
+     * has run, internal RAM is fragmented enough that the largest single
+     * contiguous block reliably available is ~31.7KB (see HEAP diag log),
+     * capped by a fixed 32KB region CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL
+     * reserves for PSRAM DMA bounce buffers. 32768 never fits; this stays
+     * safely under that ceiling with headroom. */
     BaseType_t ok = xTaskCreatePinnedToCore(audio_task,
                                             "audio_capture",
-                                            32768,
+                                            28672,
                                             NULL,
                                             5,
                                             &s_audio_task,

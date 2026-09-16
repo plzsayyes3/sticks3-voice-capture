@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "driver/rtc_io.h"
 #include "esp_timer.h"
@@ -344,6 +345,9 @@ static bool app_ui_allows_recording_start(void)
 
 static uint32_t start_recording(void)
 {
+    ESP_LOGW(TAG, "HEAP diag: free=%u largest_free_block=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     const bool ble_ready = voice_ble_is_ready();
     const bool ota_active = voice_ble_ota_is_active();
     const bool ui_allows_start = app_ui_allows_recording_start();
@@ -1020,6 +1024,9 @@ void app_main(void)
     ESP_LOGI(TAG, "boot reset_reason=%d wakeup_cause=%d ext1_status=0x%llx",
              esp_reset_reason(), esp_sleep_get_wakeup_cause(),
              (unsigned long long)esp_sleep_get_ext1_wakeup_status());
+    ESP_LOGW(TAG, "HEAP diag: free=%u largest_free_block=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     ESP_ERROR_CHECK(init_power_management());
     ESP_ERROR_CHECK(stick_s3_board_init());
@@ -1069,7 +1076,12 @@ void app_main(void)
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_XTAL_FREQ,
-        .light_sleep_enable = true,
+        /* false while bring-up/debugging over USB: automatic light sleep
+         * makes USB-Serial-JTAG unresponsive, which breaks esptool's
+         * reset-to-bootloader handshake for reflashing. Revert to true
+         * for the production power design (see Gate 13 in the project's
+         * canonical doc). */
+        .light_sleep_enable = false,
     };
     esp_pm_configure(&pm_config);
 }

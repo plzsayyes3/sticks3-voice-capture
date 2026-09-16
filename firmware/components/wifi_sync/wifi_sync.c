@@ -84,10 +84,13 @@ esp_err_t wifi_sync_init(void)
         esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL),
         TAG, "register ip event handler");
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi set mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+    /* Deliberately not calling esp_wifi_init()/start() here: even without
+     * starting the radio, esp_wifi_init() permanently reserves tens of KB
+     * of internal RAM for its RX/TX buffers, which starved the audio
+     * pipeline's 32KB task-stack allocation (ESP_ERR_NO_MEM on recording
+     * start). The whole Wi-Fi driver lifecycle — init, start, stop, deinit
+     * — now lives inside wifi_sync_task, so that memory only exists for
+     * the duration of an actual Sync. */
 
     s_initialized = true;
     return ESP_OK;
@@ -287,6 +290,27 @@ static void wifi_sync_task(void *arg)
 {
     (void)arg;
 
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi init failed: %s", esp_err_to_name(err));
+        atomic_store(&s_sync_running, false);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi start failed: %s", esp_err_to_name(err));
+        esp_wifi_deinit();
+        atomic_store(&s_sync_running, false);
+        vTaskDelete(NULL);
+        return;
+    }
+
     if (connect_to_known_network()) {
         sync_pending_recordings();
         esp_wifi_disconnect();
@@ -294,6 +318,8 @@ static void wifi_sync_task(void *arg)
         ESP_LOGW(TAG, "no known Wi-Fi network in range; recordings stay on device");
     }
 
+    esp_wifi_stop();
+    esp_wifi_deinit();
     atomic_store(&s_sync_running, false);
     vTaskDelete(NULL);
 }
