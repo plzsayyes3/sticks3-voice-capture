@@ -6,3 +6,9 @@ firmware/sdkconfig.old
 firmware/dependencies.lock
 *.log
 .DS_Store
+eim_config.toml
+recording-dump/
+recording-dump-*/
+local-receiver/.venv/
+local-receiver/.env
+local-receiver/__pycache__/
