@@ -17,6 +17,13 @@ from flask import Flask, abort, jsonify, request
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 
+# GitHub's Contents API writes update a single mutable branch ref, so two
+# concurrent pushes race even when they touch different files — the loser
+# gets a 409 (stale base SHA). Recordings can finish processing in
+# parallel (e.g. a batch uploaded together by Wi-Fi Sync), so serialize
+# the actual push.
+_mynotebook_push_lock = threading.Lock()
+
 RECORDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 ALLOWED_AUDIO_TYPES = {"audio/ogg", "audio/opus", "application/ogg"}
 JST = ZoneInfo("Asia/Tokyo")
@@ -187,7 +194,8 @@ def process_recording_async(recording_id: str) -> None:
             markdown_path.write_text(markdown, encoding="utf-8")
 
         notebook_path = mynotebook_path(recording_id, metadata["received_at"])
-        notebook_status = push_to_mynotebook(notebook_path, markdown)
+        with _mynotebook_push_lock:
+            notebook_status = push_to_mynotebook(notebook_path, markdown)
 
         done_path = DONE_DIR / f"{recording_id}.json"
         done_path.write_text(
