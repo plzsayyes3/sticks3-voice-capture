@@ -275,6 +275,34 @@ static void log_recoverable_partials(void)
     }
 }
 
+const char *recording_store_base_path(void)
+{
+    return STORAGE_BASE_PATH;
+}
+
+esp_err_t recording_store_get_usage(uint64_t *used_bytes, uint64_t *capacity_bytes)
+{
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint64_t total = 0;
+    uint64_t free_space = 0;
+    esp_err_t err = esp_vfs_fat_info(STORAGE_BASE_PATH, &total, &free_space);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (capacity_bytes) {
+        *capacity_bytes = total;
+    }
+    if (used_bytes) {
+        *used_bytes = total > free_space ? total - free_space : 0;
+    }
+    return ESP_OK;
+}
+
 esp_err_t recording_store_init(void)
 {
     if (s_mounted) {
