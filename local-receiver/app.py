@@ -39,6 +39,10 @@ WHISPER_BIN = os.getenv("WHISPER_CLI", "whisper-cli")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", str(Path.home() / "whisper-models" / "ggml-large-v3-turbo.bin"))
 WHISPER_VAD_MODEL = os.getenv("WHISPER_VAD_MODEL", str(Path.home() / "whisper-models" / "ggml-silero-v5.1.2.bin"))
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ja")
+# Metal (GPU) whisper-cli aborts with SIGABRT on this Mac; default to CPU
+# (-ng / no-GPU) until that's root-caused. Set WHISPER_USE_GPU=1 to opt
+# back into Metal once it's fixed or on a machine where it works.
+WHISPER_USE_GPU = os.getenv("WHISPER_USE_GPU", "0").strip() not in ("", "0", "false", "False")
 
 for _dir in (RECORDINGS_DIR, TRANSCRIPTS_DIR, NOTES_DIR, DONE_DIR, METADATA_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +65,14 @@ def require_device_token() -> None:
         abort(403)
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write via a same-directory temp file + os.replace so a crash mid-write
+    can never leave a truncated/corrupt JSON or Markdown file behind."""
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def metadata_path(recording_id: str) -> Path:
     return METADATA_DIR / f"{recording_id}.json"
 
@@ -73,9 +85,9 @@ def read_metadata(recording_id: str):
 
 
 def write_metadata(recording_id: str, metadata: dict) -> None:
-    metadata_path(recording_id).write_text(
+    atomic_write_text(
+        metadata_path(recording_id),
         json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
     )
 
 
@@ -102,19 +114,25 @@ def transcribe_ogg(ogg_path: Path) -> str:
         )
 
         out_prefix = Path(temp_dir) / "transcript"
-        subprocess.run(
-            [
-                WHISPER_BIN,
-                "-m", WHISPER_MODEL,
-                "-l", WHISPER_LANGUAGE,
-                "-f", str(wav_path),
-                "--vad", "-vm", WHISPER_VAD_MODEL,
-                "-of", str(out_prefix),
-                "--output-txt",
-                "--no-prints",
-            ],
-            check=True, capture_output=True,
-        )
+        whisper_cmd = [
+            WHISPER_BIN,
+            "-m", WHISPER_MODEL,
+            "-l", WHISPER_LANGUAGE,
+            "-f", str(wav_path),
+            "--vad", "-vm", WHISPER_VAD_MODEL,
+            "-of", str(out_prefix),
+            "--output-txt",
+            "--no-prints",
+        ]
+        if not WHISPER_USE_GPU:
+            whisper_cmd.append("-ng")
+        result = subprocess.run(whisper_cmd, capture_output=True)
+        if result.returncode != 0:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace")[-2000:]
+            raise RuntimeError(
+                f"whisper-cli exited {result.returncode} (signal crash is common "
+                f"with Metal — check WHISPER_USE_GPU): {stderr_tail}"
+            )
 
         text_path = out_prefix.with_suffix(".txt")
         transcript = text_path.read_text(encoding="utf-8").strip()
@@ -184,21 +202,22 @@ def process_recording_async(recording_id: str) -> None:
             transcript = transcript_path.read_text(encoding="utf-8")
         else:
             transcript = transcribe_ogg(ogg_path)
-            transcript_path.write_text(transcript, encoding="utf-8")
+            atomic_write_text(transcript_path, transcript)
 
         markdown_path = NOTES_DIR / f"{recording_id}.md"
         if markdown_path.exists():
             markdown = markdown_path.read_text(encoding="utf-8")
         else:
             markdown = render_markdown(recording_id, metadata["received_at"], transcript)
-            markdown_path.write_text(markdown, encoding="utf-8")
+            atomic_write_text(markdown_path, markdown)
 
         notebook_path = mynotebook_path(recording_id, metadata["received_at"])
         with _mynotebook_push_lock:
             notebook_status = push_to_mynotebook(notebook_path, markdown)
 
         done_path = DONE_DIR / f"{recording_id}.json"
-        done_path.write_text(
+        atomic_write_text(
+            done_path,
             json.dumps(
                 {
                     "recording_id": recording_id,
@@ -208,10 +227,23 @@ def process_recording_async(recording_id: str) -> None:
                 },
                 ensure_ascii=False,
             ),
-            encoding="utf-8",
         )
     except Exception:
         app.logger.exception("processing failed for %s", recording_id)
+
+
+def reprocess_pending_recordings() -> None:
+    """Resume any recording whose upload was durably stored but never
+    finished processing (e.g. this service restarted, crashed, or the Mac
+    slept between the 201 response and process_recording_async completing).
+    The device already renamed the file to .sent after the 201, so without
+    this it would never be retried by either side."""
+    for meta_path in METADATA_DIR.glob("*.json"):
+        recording_id = meta_path.stem
+        if (DONE_DIR / f"{recording_id}.json").exists():
+            continue
+        app.logger.info("resuming unfinished recording %s from startup scan", recording_id)
+        threading.Thread(target=process_recording_async, args=(recording_id,), daemon=True).start()
 
 
 @app.get("/health")
@@ -277,5 +309,6 @@ def too_large(_error):
 
 
 if __name__ == "__main__":
+    reprocess_pending_recordings()
     port = int(os.getenv("PORT", "8090"))
     app.run(host="0.0.0.0", port=port)

@@ -11,6 +11,9 @@ eim_config.toml
 recording-dump/
 recording-dump-*/
 local-receiver/.venv/
+local-receiver/.test-venv/
 local-receiver/.env
 local-receiver/__pycache__/
+local-receiver/tests/__pycache__/
+local-receiver/.pytest_cache/
 scripts/.icon-venv/
