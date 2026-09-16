@@ -30,6 +30,10 @@ jobs:
           path: firmware
           command: |
             set -euo pipefail
+            # secrets.h is gitignored (real Wi-Fi credentials/device token
+            # never get committed); use the placeholder template so CI can
+            # still verify the build compiles and fits the OTA slot.
+            cp components/wifi_sync/include/secrets.h.example components/wifi_sync/include/secrets.h
             idf.py build
             image="build/voice_stick.bin"
             test -f "$image"
