@@ -39,6 +39,8 @@ static const char *TAG = "voice_stick";
 #define SIDE_LONG_PRESS_MS 700
 #define CAPACITY_DISPLAY_TIMEOUT_MS (4 * 1000)
 #define CAPACITY_DISPLAY_TIMEOUT_US (CAPACITY_DISPLAY_TIMEOUT_MS * 1000ULL)
+#define SYNC_RESULT_DISPLAY_TIMEOUT_MS (2 * 1000)
+#define SYNC_RESULT_DISPLAY_TIMEOUT_US (SYNC_RESULT_DISPLAY_TIMEOUT_MS * 1000ULL)
 
 static bool s_recording;
 static bool s_ota_updating;
@@ -53,6 +55,7 @@ static esp_timer_handle_t s_deep_sleep_timer;
 static esp_timer_handle_t s_battery_refresh_timer;
 static esp_timer_handle_t s_host_response_timer;
 static esp_timer_handle_t s_capacity_display_timer;
+static esp_timer_handle_t s_sync_result_display_timer;
 static uint32_t s_session_id = 1;
 static QueueHandle_t s_app_event_queue;
 static button_handle_t s_front_button;
@@ -112,6 +115,7 @@ typedef enum {
     APP_EVENT_OTA_DONE,
     APP_EVENT_OTA_END,
     APP_EVENT_HOST_RESPONSE_TIMEOUT,
+    APP_EVENT_WIFI_SYNC_DONE,
 } app_event_type_t;
 
 typedef struct {
@@ -129,6 +133,7 @@ static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, ui
 static void queue_ui_state_event(const char *state, const char *text);
 static void apply_interaction_mode(interaction_mode_t mode);
 static void show_storage_capacity(void);
+static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsigned failed);
 
 static bool is_external_powered(void)
 {
@@ -432,6 +437,29 @@ static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, ui
     }
 }
 
+static void queue_wifi_sync_done_event(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
+{
+    if (s_app_event_queue) {
+        app_event_t event = {
+            .type = APP_EVENT_WIFI_SYNC_DONE,
+            .written = uploaded,
+            .size = failed,
+            /* Reusing .error (esp_err_t) to carry wifi_sync_result_t here,
+             * not an actual esp_err_t — APP_EVENT_WIFI_SYNC_DONE is the
+             * only handler that reads it, and it casts back. */
+            .error = (esp_err_t)result,
+        };
+        (void)xQueueSend(s_app_event_queue, &event, 0);
+    }
+}
+
+/* Runs on the wifi_sync task, not the main event-loop task — must only
+ * queue an event, never touch UI or app state directly. */
+static void wifi_sync_done_cb(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
+{
+    queue_wifi_sync_done_event(result, uploaded, failed);
+}
+
 static void queue_app_event_from_isr(app_event_type_t type, BaseType_t *high_task_woken)
 {
     if (s_app_event_queue) {
@@ -718,7 +746,7 @@ static void app_event_task(void *arg)
             } else if (wifi_sync_is_running()) {
                 ESP_LOGI(TAG, "Sync already in progress");
             } else {
-                ui_status_set_idle_hint("Wi-Fi Sync...");
+                ui_status_set_syncing("Wi-Fi Sync...");
                 esp_err_t sync_err = wifi_sync_start();
                 if (sync_err != ESP_OK) {
                     ESP_LOGW(TAG, "Sync start failed: %s", esp_err_to_name(sync_err));
@@ -727,6 +755,9 @@ static void app_event_task(void *arg)
             }
             break;
         }
+        case APP_EVENT_WIFI_SYNC_DONE:
+            show_sync_result((wifi_sync_result_t)event.error, event.written, event.size);
+            break;
         case APP_EVENT_UI_STATE:
             apply_app_ui_state(event.state, event.text);
             break;
@@ -750,7 +781,10 @@ static void app_event_task(void *arg)
                 ESP_LOGI(TAG, "BLE disconnected; local recording continues");
             } else {
                 s_app_ui_state = APP_UI_STATE_READY;
-                ui_status_set_pairing(voice_ble_device_name());
+                /* Local-only app: BLE disconnecting just means "no phone
+                 * app attached," which is the normal, permanent state here
+                 * — show Ready, not Pairing (see the boot-time comment). */
+                ui_status_set_idle();
             }
             break;
         case APP_EVENT_AUDIO_ERROR:
@@ -907,6 +941,57 @@ static esp_err_t init_capacity_display_timer(void)
         .name = "capacity_display",
     };
     return esp_timer_create(&timer_args, &s_capacity_display_timer);
+}
+
+static void sync_result_display_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_recording && !s_ota_updating) {
+        ui_status_set_idle();
+    }
+}
+
+static esp_err_t init_sync_result_display_timer(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = sync_result_display_timer_cb,
+        .name = "sync_result_display",
+    };
+    return esp_timer_create(&timer_args, &s_sync_result_display_timer);
+}
+
+static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
+{
+    char hint[32];
+    switch (result) {
+    case WIFI_SYNC_RESULT_OK:
+        if (uploaded > 0) {
+            snprintf(hint, sizeof(hint), "Success (%u)", uploaded);
+        } else {
+            strlcpy(hint, "Success", sizeof(hint));
+        }
+        break;
+    case WIFI_SYNC_RESULT_PARTIAL_FAIL:
+        snprintf(hint, sizeof(hint), "%u failed", failed);
+        break;
+    case WIFI_SYNC_RESULT_NO_NETWORK:
+        strlcpy(hint, "No network", sizeof(hint));
+        break;
+    case WIFI_SYNC_RESULT_ERROR:
+    default:
+        strlcpy(hint, "Sync error", sizeof(hint));
+        break;
+    }
+    ESP_LOGI(TAG, "wifi sync result: %s (uploaded=%u failed=%u)", hint, uploaded, failed);
+    ui_status_set_syncing(hint);
+
+    if (s_sync_result_display_timer) {
+        (void)esp_timer_stop(s_sync_result_display_timer);
+        esp_err_t timer_err = esp_timer_start_once(s_sync_result_display_timer, SYNC_RESULT_DISPLAY_TIMEOUT_US);
+        if (timer_err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to arm sync result display timer: %s", esp_err_to_name(timer_err));
+        }
+    }
 }
 
 static void show_storage_capacity(void)
@@ -1086,6 +1171,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ui_status_init());
     ESP_ERROR_CHECK(init_display_dim_timer());
     ESP_ERROR_CHECK(init_capacity_display_timer());
+    ESP_ERROR_CHECK(init_sync_result_display_timer());
     ESP_ERROR_CHECK(init_deep_sleep_timer());
     ESP_ERROR_CHECK(init_host_response_timer());
     note_activity();
@@ -1099,6 +1185,7 @@ void app_main(void)
         ESP_LOGW(TAG, "Wi-Fi Sync init failed; side-button Sync unavailable, local recording unaffected: %s",
                  esp_err_to_name(wifi_sync_err));
     }
+    wifi_sync_set_done_callback(wifi_sync_done_cb);
 
     esp_err_t ble_err = voice_ble_init();
     if (ble_err != ESP_OK) {
@@ -1116,9 +1203,11 @@ void app_main(void)
     } else {
         audio_pipeline_set_error_callback(audio_pipeline_error_cb);
         apply_interaction_mode(INTERACTION_MODE_CLICK_TO_TALK);
-        if (ble_err == ESP_OK) {
-            ui_status_set_pairing(voice_ble_device_name());
-        }
+        /* This app is local-only now (no BLE companion app), so BLE never
+         * connects in normal use — showing "Pairing" here would mean the
+         * screen reads "Pairing" almost permanently. Show "Ready" instead;
+         * the BLE radio still advertises in the background regardless. */
+        ui_status_set_idle();
     }
     ESP_LOGI(TAG, "Voice Stick booted");
 

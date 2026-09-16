@@ -44,6 +44,19 @@ static const char *TAG = "wifi_sync";
 static bool s_initialized;
 static atomic_bool s_sync_running;
 static EventGroupHandle_t s_wifi_event_group;
+static wifi_sync_done_cb_t s_done_cb;
+
+void wifi_sync_set_done_callback(wifi_sync_done_cb_t callback)
+{
+    s_done_cb = callback;
+}
+
+static void notify_done(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
+{
+    if (s_done_cb) {
+        s_done_cb(result, uploaded, failed);
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -313,7 +326,7 @@ static void collect_sync_candidates(const char *base_path, sync_candidates_t *ou
     closedir(dir);
 }
 
-static void sync_pending_recordings(void)
+static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed)
 {
     const char *base_path = recording_store_base_path();
 
@@ -327,6 +340,8 @@ static void sync_pending_recordings(void)
     sync_candidates_t *candidates = malloc(sizeof(sync_candidates_t));
     if (!candidates) {
         ESP_LOGE(TAG, "sync: out of memory collecting candidates");
+        *out_uploaded = 0;
+        *out_failed = 1; /* couldn't even try; treat as a failure for the UI */
         return;
     }
     collect_sync_candidates(base_path, candidates);
@@ -381,6 +396,8 @@ static void sync_pending_recordings(void)
     ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed, %u stale .sent cleared",
              uploaded, failed, (unsigned)candidates->stale_sent_count);
     free(candidates);
+    *out_uploaded = uploaded;
+    *out_failed = failed;
 }
 
 static void wifi_sync_task(void *arg)
@@ -391,6 +408,7 @@ static void wifi_sync_task(void *arg)
     esp_err_t err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi init failed: %s", esp_err_to_name(err));
+        notify_done(WIFI_SYNC_RESULT_ERROR, 0, 0);
         atomic_store(&s_sync_running, false);
         vTaskDelete(NULL);
         return;
@@ -403,16 +421,21 @@ static void wifi_sync_task(void *arg)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi start failed: %s", esp_err_to_name(err));
         esp_wifi_deinit();
+        notify_done(WIFI_SYNC_RESULT_ERROR, 0, 0);
         atomic_store(&s_sync_running, false);
         vTaskDelete(NULL);
         return;
     }
 
     if (connect_to_known_network()) {
-        sync_pending_recordings();
+        unsigned uploaded = 0;
+        unsigned failed = 0;
+        sync_pending_recordings(&uploaded, &failed);
         esp_wifi_disconnect();
+        notify_done(failed > 0 ? WIFI_SYNC_RESULT_PARTIAL_FAIL : WIFI_SYNC_RESULT_OK, uploaded, failed);
     } else {
         ESP_LOGW(TAG, "no known Wi-Fi network in range; recordings stay on device");
+        notify_done(WIFI_SYNC_RESULT_NO_NETWORK, 0, 0);
     }
 
     esp_wifi_stop();
