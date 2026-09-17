@@ -239,7 +239,19 @@ static esp_err_t upload_file(const char *path, const char *recording_id, const c
 
     esp_err_t err = esp_http_client_open(client, (int)size);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "http open failed for %s: %s", recording_id, esp_err_to_name(err));
+        /* ESP_ERR_HTTP_CONNECT alone doesn't distinguish DNS failure from
+         * TCP refusal from a TLS handshake failure — pull the underlying
+         * errno and (for the HTTPS fallback) the mbedtls verification
+         * result so a failure on an unfamiliar network is diagnosable
+         * without needing to raise the global log level (costly on an
+         * OTA slot already down to ~2% free). */
+        int sock_errno = esp_http_client_get_errno(client);
+        int tls_error_code = 0;
+        int tls_flags = 0;
+        esp_err_t tls_err = esp_http_client_get_and_clear_last_tls_error(client, &tls_error_code, &tls_flags);
+        ESP_LOGE(TAG, "http open failed for %s: %s (errno=%d tls_err=%s tls_code=0x%x tls_flags=0x%x)",
+                 recording_id, esp_err_to_name(err), sock_errno, esp_err_to_name(tls_err),
+                 (unsigned)tls_error_code, (unsigned)tls_flags);
         fclose(file);
         esp_http_client_cleanup(client);
         return err;
@@ -454,7 +466,19 @@ esp_err_t wifi_sync_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(wifi_sync_task, "wifi_sync", 8192, NULL, 4, NULL, 0);
+    /* 8192 was enough for plain-HTTP LAN uploads, but a real mbedTLS
+     * handshake (cert-bundle verification, crypto) against the Funnel
+     * fallback overflowed it in practice — this task's own stack, not
+     * heap, so the earlier MBEDTLS_EXTERNAL_MEM_ALLOC (PSRAM) change
+     * didn't touch it. This task never runs during flash cache-disabled
+     * windows the way audio/writer tasks do at the same instant sync
+     * runs (recording is now mutually exclusive with sync), but it does
+     * do its own flash file I/O (upload_file's fopen/fread, sync's
+     * remove()), so its stack still has to live in internal RAM, not
+     * PSRAM — same constraint as audio_task. 16384 comfortably clears
+     * the ~31.7KB largest-contiguous-internal-RAM-block ceiling this
+     * project already lives under (CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL). */
+    BaseType_t ok = xTaskCreatePinnedToCore(wifi_sync_task, "wifi_sync", 16384, NULL, 4, NULL, 0);
     if (ok != pdPASS) {
         atomic_store(&s_sync_running, false);
         return ESP_ERR_NO_MEM;
