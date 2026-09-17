@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import subprocess
 import tempfile
@@ -23,6 +24,13 @@ app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 102
 # parallel (e.g. a batch uploaded together by Wi-Fi Sync), so serialize
 # the actual push.
 _mynotebook_push_lock = threading.Lock()
+
+# whisper-cli is CPU-bound and heavy (see WHISPER_USE_GPU — even Metal was
+# disabled after it crashed). Spawning one thread per upload let a batch
+# sync run several whisper-cli processes at once, competing for the same
+# CPU/GPU and memory. A single persistent worker processes recordings
+# strictly one at a time; the queue absorbs bursts instead.
+_processing_queue: "queue.Queue[str]" = queue.Queue()
 
 RECORDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 ALLOWED_AUDIO_TYPES = {"audio/ogg", "audio/opus", "application/ogg"}
@@ -232,6 +240,18 @@ def process_recording_async(recording_id: str) -> None:
         app.logger.exception("processing failed for %s", recording_id)
 
 
+def _processing_worker_loop() -> None:
+    while True:
+        recording_id = _processing_queue.get()
+        try:
+            process_recording_async(recording_id)
+        finally:
+            _processing_queue.task_done()
+
+
+threading.Thread(target=_processing_worker_loop, daemon=True).start()
+
+
 def reprocess_pending_recordings() -> None:
     """Resume any recording whose upload was durably stored but never
     finished processing (e.g. this service restarted, crashed, or the Mac
@@ -243,7 +263,7 @@ def reprocess_pending_recordings() -> None:
         if (DONE_DIR / f"{recording_id}.json").exists():
             continue
         app.logger.info("resuming unfinished recording %s from startup scan", recording_id)
-        threading.Thread(target=process_recording_async, args=(recording_id,), daemon=True).start()
+        _processing_queue.put(recording_id)
 
 
 @app.get("/health")
@@ -290,8 +310,9 @@ def receive_recording():
         )
 
     # Device only needs the durable write to count as "sent" — transcription
-    # runs in the background and its failure must not block the device.
-    threading.Thread(target=process_recording_async, args=(recording_id,), daemon=True).start()
+    # runs in the background (single worker, see _processing_worker_loop)
+    # and its failure must not block the device.
+    _processing_queue.put(recording_id)
 
     return jsonify(
         {

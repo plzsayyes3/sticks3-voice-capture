@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -43,6 +44,19 @@ static const char *TAG = "wifi_sync";
 static bool s_initialized;
 static atomic_bool s_sync_running;
 static EventGroupHandle_t s_wifi_event_group;
+static wifi_sync_done_cb_t s_done_cb;
+
+void wifi_sync_set_done_callback(wifi_sync_done_cb_t callback)
+{
+    s_done_cb = callback;
+}
+
+static void notify_done(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
+{
+    if (s_done_cb) {
+        s_done_cb(result, uploaded, failed);
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -182,7 +196,7 @@ static void recording_id_from_filename(const char *name, char *out, size_t out_s
     out[id_len] = '\0';
 }
 
-static esp_err_t upload_file(const char *path, const char *recording_id)
+static esp_err_t upload_file(const char *path, const char *recording_id, const char *base_url)
 {
     FILE *file = fopen(path, "rb");
     if (!file) {
@@ -199,7 +213,7 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
     }
 
     char url[PATH_BUFFER_SIZE];
-    snprintf(url, sizeof(url), "%s/v1/recordings", STICKS3_RECEIVER_URL);
+    snprintf(url, sizeof(url), "%s/v1/recordings", base_url);
     char auth_header[160];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", STICKS3_DEVICE_TOKEN);
 
@@ -207,6 +221,11 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 20000,
+        /* Only exercised for the https:// fallback URL (Tailscale Funnel);
+         * a no-op for the plain http:// LAN URL. Needed to verify the
+         * Funnel endpoint's Let's Encrypt cert against ESP-IDF's bundled
+         * Mozilla root CA set (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y). */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -220,7 +239,19 @@ static esp_err_t upload_file(const char *path, const char *recording_id)
 
     esp_err_t err = esp_http_client_open(client, (int)size);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "http open failed for %s: %s", recording_id, esp_err_to_name(err));
+        /* ESP_ERR_HTTP_CONNECT alone doesn't distinguish DNS failure from
+         * TCP refusal from a TLS handshake failure — pull the underlying
+         * errno and (for the HTTPS fallback) the mbedtls verification
+         * result so a failure on an unfamiliar network is diagnosable
+         * without needing to raise the global log level (costly on an
+         * OTA slot already down to ~2% free). */
+        int sock_errno = esp_http_client_get_errno(client);
+        int tls_error_code = 0;
+        int tls_flags = 0;
+        esp_err_t tls_err = esp_http_client_get_and_clear_last_tls_error(client, &tls_error_code, &tls_flags);
+        ESP_LOGE(TAG, "http open failed for %s: %s (errno=%d tls_err=%s tls_code=0x%x tls_flags=0x%x)",
+                 recording_id, esp_err_to_name(err), sock_errno, esp_err_to_name(tls_err),
+                 (unsigned)tls_error_code, (unsigned)tls_flags);
         fclose(file);
         esp_http_client_cleanup(client);
         return err;
@@ -307,7 +338,7 @@ static void collect_sync_candidates(const char *base_path, sync_candidates_t *ou
     closedir(dir);
 }
 
-static void sync_pending_recordings(void)
+static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed)
 {
     const char *base_path = recording_store_base_path();
 
@@ -321,6 +352,8 @@ static void sync_pending_recordings(void)
     sync_candidates_t *candidates = malloc(sizeof(sync_candidates_t));
     if (!candidates) {
         ESP_LOGE(TAG, "sync: out of memory collecting candidates");
+        *out_uploaded = 0;
+        *out_failed = 1; /* couldn't even try; treat as a failure for the UI */
         return;
     }
     collect_sync_candidates(base_path, candidates);
@@ -344,7 +377,18 @@ static void sync_pending_recordings(void)
         char recording_id[PATH_BUFFER_SIZE];
         recording_id_from_filename(candidates->pending[i], recording_id, sizeof(recording_id));
 
-        if (upload_file(full_path, recording_id) == ESP_OK) {
+        /* Try the LAN (mDNS hostname, plain HTTP, no internet round-trip)
+         * first since it's faster and keeps the audio on-network; fall
+         * back to the Tailscale Funnel URL (HTTPS, public) only if that
+         * fails — e.g. the device is away from home and mDNS can't
+         * resolve, or the Mac is unreachable on the LAN for any reason. */
+        esp_err_t upload_err = upload_file(full_path, recording_id, STICKS3_RECEIVER_URL);
+        if (upload_err != ESP_OK) {
+            ESP_LOGW(TAG, "LAN upload failed for %s, trying fallback URL", candidates->pending[i]);
+            upload_err = upload_file(full_path, recording_id, STICKS3_RECEIVER_URL_FALLBACK);
+        }
+
+        if (upload_err == ESP_OK) {
             /* The receiver fsyncs the recording durably and dedupes by
              * SHA-256 before replying 200/201, so a success response means
              * the recording is safe on the Mac. Delete rather than rename
@@ -364,6 +408,8 @@ static void sync_pending_recordings(void)
     ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed, %u stale .sent cleared",
              uploaded, failed, (unsigned)candidates->stale_sent_count);
     free(candidates);
+    *out_uploaded = uploaded;
+    *out_failed = failed;
 }
 
 static void wifi_sync_task(void *arg)
@@ -374,6 +420,7 @@ static void wifi_sync_task(void *arg)
     esp_err_t err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi init failed: %s", esp_err_to_name(err));
+        notify_done(WIFI_SYNC_RESULT_ERROR, 0, 0);
         atomic_store(&s_sync_running, false);
         vTaskDelete(NULL);
         return;
@@ -386,16 +433,21 @@ static void wifi_sync_task(void *arg)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi start failed: %s", esp_err_to_name(err));
         esp_wifi_deinit();
+        notify_done(WIFI_SYNC_RESULT_ERROR, 0, 0);
         atomic_store(&s_sync_running, false);
         vTaskDelete(NULL);
         return;
     }
 
     if (connect_to_known_network()) {
-        sync_pending_recordings();
+        unsigned uploaded = 0;
+        unsigned failed = 0;
+        sync_pending_recordings(&uploaded, &failed);
         esp_wifi_disconnect();
+        notify_done(failed > 0 ? WIFI_SYNC_RESULT_PARTIAL_FAIL : WIFI_SYNC_RESULT_OK, uploaded, failed);
     } else {
         ESP_LOGW(TAG, "no known Wi-Fi network in range; recordings stay on device");
+        notify_done(WIFI_SYNC_RESULT_NO_NETWORK, 0, 0);
     }
 
     esp_wifi_stop();
@@ -414,7 +466,19 @@ esp_err_t wifi_sync_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(wifi_sync_task, "wifi_sync", 8192, NULL, 4, NULL, 0);
+    /* 8192 was enough for plain-HTTP LAN uploads, but a real mbedTLS
+     * handshake (cert-bundle verification, crypto) against the Funnel
+     * fallback overflowed it in practice — this task's own stack, not
+     * heap, so the earlier MBEDTLS_EXTERNAL_MEM_ALLOC (PSRAM) change
+     * didn't touch it. This task never runs during flash cache-disabled
+     * windows the way audio/writer tasks do at the same instant sync
+     * runs (recording is now mutually exclusive with sync), but it does
+     * do its own flash file I/O (upload_file's fopen/fread, sync's
+     * remove()), so its stack still has to live in internal RAM, not
+     * PSRAM — same constraint as audio_task. 16384 comfortably clears
+     * the ~31.7KB largest-contiguous-internal-RAM-block ceiling this
+     * project already lives under (CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL). */
+    BaseType_t ok = xTaskCreatePinnedToCore(wifi_sync_task, "wifi_sync", 16384, NULL, 4, NULL, 0);
     if (ok != pdPASS) {
         atomic_store(&s_sync_running, false);
         return ESP_ERR_NO_MEM;

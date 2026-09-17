@@ -1,103 +1,87 @@
 # StickS3 Voice Capture
 
-An offline-first voice memo recorder for M5Stack StickS3.
+*[日本語版 README](README.ja.md)*
 
-The intended device flow is record → internal Flash → explicit later Sync. The
-StickS3 does not transcribe audio. A Mac or server will transcribe uploaded clips
-and submit an AI-labelled transcript to `plzsayyes3/mynotebook`.
+An offline-first, PLAUD-style voice memo recorder built on the M5Stack StickS3.
+Wear it, press the button, talk — no phone, no network required to capture.
+Later, sync over Wi-Fi and get a verbatim transcript in your notes automatically.
 
-## Implementation status
+```text
+StickS3                          Mac (local-receiver)
+  top button → record             POST /v1/recordings
+  Opus/Ogg → internal Flash       durable write + SHA-256 idempotency
+                                        ↓
+  side button (short press)       whisper.cpp + VAD → verbatim transcript
+    → Wi-Fi Sync ───────────────→      ↓
+      LAN (mDNS hostname)        mynotebook/00_inbox (no summarization)
+      → Tailscale Funnel (HTTPS) if off-LAN
+```
 
-The firmware baseline comes from VoiceStick, but the current local-recording MVP
-no longer uses BLE as the audio sink. VoiceStick still supplies the proven
-StickS3 board, ES8311/I2S, Opus, button, display, power, and OTA foundation.
+## Status
 
-On `feature/local-recording-mvp` the first storage implementation now exists:
+The local-recording → Wi-Fi Sync → local transcription → notebook pipeline
+works end-to-end on real hardware. All 11 Device Recording Acceptance Gates
+(build, OTA size, partition layout, short/multi-recording, `.ogg` finalize,
+real playback, reboot persistence, 20-minute continuous recording, forced-reset
+resilience, `.part` recovery) are passing.
 
-- 16 kHz mono audio is encoded by the existing VoiceStick Opus encoder at
-  20 kbps using 60 ms frames.
-- Encoded Opus packets go to a dedicated Flash-writer queue rather than the BLE
-  audio queue.
-- Queue overflow is a recording failure. No oldest-packet drop path remains.
-- A dedicated `recording_store` component mounts the internal FAT partition and
-  writes independent Ogg/Opus recordings.
-- Recording starts as `*.part`; only a successful close, flush, and sync renames
-  it to `*.ogg`.
-- An interrupted or failed recording is retained as `*.part` for inspection
-  instead of overwriting or deleting earlier completed clips.
-- FAT auto-formatting is enabled only when the raw recording partition still
-  appears blank. A later mount failure does not trigger a destructive retry.
-- Ogg pages group up to 10 Opus packets and the file is periodically flushed and
-  `fsync`ed to limit the amount of audio exposed to sudden power loss.
-- The imported app shell is temporarily shimmed so BLE readiness, BLE button
-  notifications, and BLE disconnects cannot veto or terminate local capture.
+Known limitations:
+- The firmware image is within ~2% of the 2 MiB OTA slot limit — expect this
+  to need `sdkconfig` size tuning before more features can be added.
+- `light_sleep_enable` is forced `false` for USB-Serial-JTAG debug stability;
+  this needs to be reverted for accurate battery-runtime numbers.
+- Off-LAN sync depends on a Tailscale Funnel URL you set up yourself (see
+  below) — there's no bundled relay service.
 
-**This code has not yet passed the StickS3 build and device gates below.** Do not
-consider local recording reliable until those tests pass.
+## Repository layout
 
-## First functional milestone
+- `firmware/` — ESP-IDF v5.5.1 firmware (ESP32-S3 / StickS3)
+  - `components/audio_pipeline` — I2S capture → Opus encode → write queue
+  - `components/recording_store` — FAT-on-flash storage, `.part`→`.ogg`
+    finalize, usage/capacity queries
+  - `components/wifi_sync` — side-button Wi-Fi Sync client (scan known
+    networks, upload pending recordings, LAN-first with an off-LAN fallback)
+  - `components/ui_status` — LVGL status screen (icons, battery, hints)
+  - `components/stick_s3_board`, `components/voice_ble` — StickS3 board
+    bring-up and BLE, inherited from the VoiceStick baseline
+- `local-receiver/` — Flask server that receives uploads, transcribes with
+  whisper.cpp, and pushes to `mynotebook/00_inbox` (see its own README)
+- `scripts/` — flash-extraction (`extract-recordings.sh`) and UI icon
+  conversion (`convert-icon.py`) tooling
 
-One-button recording to independent Ogg/Opus files in internal Flash is accepted
-only when all of the following are verified on the physical StickS3:
+## Building the firmware
 
-- Recording starts and stops with no BLE, Wi-Fi, phone, or Mac present.
-- A completed `.ogg` decodes and plays from beginning to end.
-- Multiple recordings create independent files and do not overwrite each other.
-- At least 20 minutes of accumulated pending clips fit and remain readable.
-- A failed or interrupted recording cannot damage earlier completed clips.
-- Packet or write backlog reports failure; audio is never silently dropped.
-- Sudden reset/power interruption leaves a `.part` file and previously completed
-  `.ogg` files intact.
-- Reboot reports retained `.part` files rather than auto-deleting them.
+```bash
+cd firmware
+cp components/wifi_sync/include/secrets.h.example components/wifi_sync/include/secrets.h
+# edit secrets.h: Wi-Fi networks, STICKS3_DEVICE_TOKEN, STICKS3_RECEIVER_URL(_FALLBACK)
+idf.py build
+idf.py -p <port> flash
+```
 
-Sync, transcription, and notebook ingestion follow only after this storage
-milestone is verified on the device.
+`secrets.h` is gitignored — it holds real Wi-Fi credentials and the device's
+shared auth token and is never committed. CI builds against the placeholder
+`secrets.h.example` instead, so it verifies compilation and the OTA size
+budget without real credentials.
 
-## Device test order
+### Off-LAN sync (Tailscale Funnel)
 
-1. Build the firmware and confirm the final application image still fits each
-   2 MiB OTA slot.
-2. For the **first development install of this new partition layout**, perform a
-   clean USB install (`idf.py erase-flash` followed by `idf.py flash`). The new
-   FAT partition overlaps bytes that previously belonged to VoiceStick's larger
-   `ota_1` and SPIFFS layout, so simply writing the new partition table can leave
-   nonblank old data in the new recording region. The recorder intentionally
-   refuses to auto-format a nonblank partition because that could destroy real
-   recordings on later boots.
-3. Boot with BLE unavailable and verify the recording FAT partition mounts.
-4. Record 10–30 seconds with the front button, stop, and confirm an `.ogg` file
-   is finalized.
-5. Copy/read the file and verify duration and intelligible audio with a standard
-   Ogg/Opus decoder.
-6. Create several short recordings and verify unique filenames and preservation
-   across reboot.
-7. Record for 20 minutes and measure actual file size and remaining FAT space.
-8. During another recording, force reset/power loss after several seconds;
-   verify a `.part` remains and all earlier `.ogg` files are unchanged.
-9. Only after the above passes, begin side-button Wi-Fi Sync work.
+`STICKS3_RECEIVER_URL` (LAN, mDNS hostname) is tried first; if that fails,
+`STICKS3_RECEIVER_URL_FALLBACK` is tried. To set the fallback up:
 
-A production migration path that preserves recordings across partition-layout
-changes is a separate problem. Do not use `erase-flash` once the device contains
-recordings that need to be kept.
+```bash
+tailscale funnel --bg --https=10000 8090
+```
 
-## Flash layout and OTA
+This exposes the Mac's local-receiver (port 8090) over public HTTPS via your
+Tailscale account. The existing Bearer-token auth is what actually protects
+the endpoint, since the URL itself is reachable by anyone who has it.
 
-The 8 MiB Flash is split into two 2 MiB OTA app slots and a `0x3f0000` byte
-(3.9375 MiB) FAT data partition, plus NVS, OTA metadata, and PHY data. The
-VoiceStick v0.3.2 OTA image used as the baseline was 1,418,048 bytes, leaving
-679,104 bytes of headroom in each app slot before local recorder and later Wi-Fi
-Sync code are added. Every firmware image must be checked against the 2 MiB slot
-limit before release.
+## Running the receiver
 
-At a fixed 20 kbps, 20 minutes of Opus audio is 3,000,000 bytes before Ogg,
-FAT, and wear-levelling overhead. The current writer groups up to 10 × 60 ms
-Opus packets per Ogg page to keep container overhead small. The 20-minute target
-remains a physical-device capacity test, not a claim based only on arithmetic.
-
-Changing the partition table requires an initial USB flash of the new table.
-VoiceStick's existing BLE app OTA can then continue between `ota_0` and `ota_1`;
-that app-only updater does not migrate a previously installed partition table.
-Back up any existing device recordings before installing a different table.
+See [local-receiver/README.md](local-receiver/README.md) for setup,
+requirements (ffmpeg, whisper.cpp + a VAD model), and the durability/
+idempotency contract.
 
 ## Sources
 
@@ -105,7 +89,7 @@ The imported firmware comes from [`78/voicestick`](https://github.com/78/voicest
 at commit `e865d68c1d96411571cbe1501a301ebe3c98f3b3`. Its original MIT
 license and copyright notice are preserved in [LICENSE](LICENSE).
 
-The deferred Sync queue and server contract are being evaluated against
+The Sync queue and server contract were evaluated against
 [`guzus/open-plaud`](https://github.com/guzus/open-plaud). Its Ogg/Opus writer
 was used as a design reference; this repository implements its local packet
 writer separately around the existing VoiceStick encoder.

@@ -35,3 +35,17 @@ CONFIG_FATFS_MAX_LFN=64
 
 CONFIG_BT_CTRL_MODEM_SLEEP=y
 CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
+
+# The full Mozilla root CA bundle (default) pushed the image over the 2MiB
+# OTA slot when TLS support (for the Tailscale Funnel fallback URL) was
+# added. The common-CA subset is far smaller and still covers Let's
+# Encrypt's ISRG Root X1, which is all this project's TLS use needs.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# mbedTLS defaults to allocating its SSL handshake/record buffers from
+# internal RAM only, which this project already runs critically low on
+# during Wi-Fi Sync (Wi-Fi driver + BLE both active). The Funnel-fallback
+# HTTPS path failed with MBEDTLS_ERR_SSL_ALLOC_FAILED the first time it
+# was actually exercised off the home LAN. PSRAM has 8MB free, so route
+# mbedTLS's buffers there instead.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

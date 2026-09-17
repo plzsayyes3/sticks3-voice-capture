@@ -7,6 +7,7 @@ startup reprocessing scan; it does not exercise real transcription quality —
 that still needs a manual run against whisper-cli (see README).
 """
 import importlib
+import threading
 import time
 
 import pytest
@@ -125,6 +126,37 @@ def test_same_id_different_audio_returns_409(client, app_module):
     assert second.status_code == 409
 
     assert wait_for_done(app_module, "rec-007")
+
+
+def test_recordings_are_transcribed_one_at_a_time(client, app_module):
+    """A batch Wi-Fi Sync uploads several recordings back to back; whisper-cli
+    is CPU/GPU-heavy, so they must be processed by a single worker, not one
+    thread per upload racing on the same machine."""
+    lock = threading.Lock()
+    state = {"concurrent": 0, "max_concurrent": 0}
+
+    def tracked_transcribe(ogg_path):
+        with lock:
+            state["concurrent"] += 1
+            state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
+        time.sleep(0.1)
+        with lock:
+            state["concurrent"] -= 1
+        return "テスト文字起こし"
+
+    app_module.transcribe_ogg = tracked_transcribe
+
+    for i in range(4):
+        resp = client.post(
+            "/v1/recordings", data=f"OggS-batch-{i}".encode(),
+            headers=auth_headers(f"rec-batch-{i}"),
+        )
+        assert resp.status_code == 201
+
+    for i in range(4):
+        assert wait_for_done(app_module, f"rec-batch-{i}", timeout=5.0)
+
+    assert state["max_concurrent"] == 1
 
 
 def test_reprocess_pending_recordings_resumes_unfinished(app_module):
