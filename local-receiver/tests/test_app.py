@@ -173,3 +173,44 @@ def test_reprocess_pending_recordings_resumes_unfinished(app_module):
     app_module.reprocess_pending_recordings()
 
     assert wait_for_done(app_module, recording_id)
+
+
+def test_load_transcription_prompt_ignores_comments_blank_and_duplicates(app_module, tmp_path):
+    dictionary = tmp_path / "dictionary.txt"
+    dictionary.write_text(
+        "# preferred vocabulary\n"
+        "StickS3\n"
+        "\n"
+        "TaskLiner\n"
+        "StickS3\n"
+        "ON HAND\n",
+        encoding="utf-8",
+    )
+
+    assert app_module.load_transcription_prompt(dictionary) == "StickS3、TaskLiner、ON HAND"
+
+
+def test_missing_transcription_dictionary_disables_prompt(app_module, tmp_path, monkeypatch):
+    missing = tmp_path / "missing-dictionary.txt"
+    monkeypatch.setattr(app_module, "WHISPER_DICTIONARY", missing)
+
+    cmd = app_module.build_whisper_command(
+        tmp_path / "audio.wav",
+        tmp_path / "transcript",
+    )
+
+    assert "--prompt" not in cmd
+
+
+def test_whisper_command_includes_dictionary_prompt(app_module, tmp_path, monkeypatch):
+    dictionary = tmp_path / "transcription-dictionary.txt"
+    dictionary.write_text("StickS3\nM5Stack\nObsidian\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "WHISPER_DICTIONARY", dictionary)
+
+    cmd = app_module.build_whisper_command(
+        tmp_path / "audio.wav",
+        tmp_path / "transcript",
+    )
+
+    prompt_index = cmd.index("--prompt")
+    assert cmd[prompt_index + 1] == "StickS3、M5Stack、Obsidian"
