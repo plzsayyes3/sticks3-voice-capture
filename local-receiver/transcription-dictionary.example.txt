@@ -1,0 +1,13 @@
+# Copy this file to transcription-dictionary.txt.
+# Add one preferred term per line. Blank lines and # comments are ignored.
+#
+# Keep personal names or workplace-specific vocabulary only in the local
+# transcription-dictionary.txt file; that file is intentionally gitignored.
+
+StickS3
+M5Stack
+TaskLiner
+ON HAND
+Project Town
+My Internet Place
+Obsidian
