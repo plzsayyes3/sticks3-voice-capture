@@ -13,6 +13,7 @@ recording-dump-*/
 local-receiver/.venv/
 local-receiver/.test-venv/
 local-receiver/.env
+local-receiver/transcription-dictionary.txt
 local-receiver/__pycache__/
 local-receiver/tests/__pycache__/
 local-receiver/.pytest_cache/
