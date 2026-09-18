@@ -47,6 +47,10 @@ WHISPER_BIN = os.getenv("WHISPER_CLI", "whisper-cli")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", str(Path.home() / "whisper-models" / "ggml-large-v3-turbo.bin"))
 WHISPER_VAD_MODEL = os.getenv("WHISPER_VAD_MODEL", str(Path.home() / "whisper-models" / "ggml-silero-v5.1.2.bin"))
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ja")
+WHISPER_DICTIONARY = Path(os.getenv(
+    "WHISPER_DICTIONARY",
+    str(Path(__file__).with_name("transcription-dictionary.txt")),
+))
 # Metal (GPU) whisper-cli aborts with SIGABRT on this Mac; default to CPU
 # (-ng / no-GPU) until that's root-caused. Set WHISPER_USE_GPU=1 to opt
 # back into Metal once it's fixed or on a machine where it works.
@@ -109,6 +113,53 @@ def store_recording_durably(recording_id: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+def load_transcription_prompt(path: Path | None = None) -> str:
+    """Load one preferred term per line for whisper.cpp's initial prompt.
+
+    Blank lines and # comments are ignored. Duplicate entries are removed while
+    preserving order. Missing dictionary files intentionally mean "no prompt"
+    so existing installations keep their current behaviour until opted in.
+    """
+    dictionary_path = path or WHISPER_DICTIONARY
+    try:
+        lines = dictionary_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+
+    entries = []
+    seen = set()
+    for raw_line in lines:
+        entry = raw_line.strip()
+        if not entry or entry.startswith("#") or entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+
+    return "、".join(entries)
+
+
+def build_whisper_command(wav_path: Path, out_prefix: Path) -> list[str]:
+    whisper_cmd = [
+        WHISPER_BIN,
+        "-m", WHISPER_MODEL,
+        "-l", WHISPER_LANGUAGE,
+        "-f", str(wav_path),
+        "--vad", "-vm", WHISPER_VAD_MODEL,
+        "-of", str(out_prefix),
+        "--output-txt",
+        "--no-prints",
+    ]
+
+    prompt = load_transcription_prompt()
+    if prompt:
+        whisper_cmd.extend(["--prompt", prompt])
+
+    if not WHISPER_USE_GPU:
+        whisper_cmd.append("-ng")
+
+    return whisper_cmd
+
+
 def transcribe_ogg(ogg_path: Path) -> str:
     with tempfile.TemporaryDirectory() as temp_dir:
         wav_path = Path(temp_dir) / "audio.wav"
@@ -122,18 +173,7 @@ def transcribe_ogg(ogg_path: Path) -> str:
         )
 
         out_prefix = Path(temp_dir) / "transcript"
-        whisper_cmd = [
-            WHISPER_BIN,
-            "-m", WHISPER_MODEL,
-            "-l", WHISPER_LANGUAGE,
-            "-f", str(wav_path),
-            "--vad", "-vm", WHISPER_VAD_MODEL,
-            "-of", str(out_prefix),
-            "--output-txt",
-            "--no-prints",
-        ]
-        if not WHISPER_USE_GPU:
-            whisper_cmd.append("-ng")
+        whisper_cmd = build_whisper_command(wav_path, out_prefix)
         result = subprocess.run(whisper_cmd, capture_output=True)
         if result.returncode != 0:
             stderr_tail = result.stderr.decode("utf-8", errors="replace")[-2000:]
