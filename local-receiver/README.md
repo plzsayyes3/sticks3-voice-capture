@@ -38,7 +38,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+cp transcription-dictionary.example.txt transcription-dictionary.txt
 # edit .env: set DEVICE_TOKEN, optionally GITHUB_TOKEN
+# edit transcription-dictionary.txt: add one preferred term per line
 ```
 
 ## Run
@@ -50,6 +52,24 @@ python app.py
 ```
 
 Listens on `0.0.0.0:8090` by default (see `PORT` in `.env.example`).
+
+## Transcription dictionary
+
+The optional `transcription-dictionary.txt` file supplies whisper.cpp's
+`--prompt` with preferred vocabulary. Put one term per line. Blank lines and
+lines beginning with `#` are ignored, and duplicate terms are removed while
+preserving their first occurrence.
+
+This is a recognition hint, not a forced replacement table: Whisper can still
+choose another spelling when the audio strongly suggests it. The transcript
+remains the direct Whisper output, so the existing "verbatim transcript first"
+design is preserved.
+
+The real dictionary is ignored by Git so names or other personal vocabulary do
+not get committed accidentally. Copy `transcription-dictionary.example.txt`
+to `transcription-dictionary.txt` and edit it locally. To keep the file
+elsewhere, set `WHISPER_DICTIONARY` to an absolute path. If the file is
+missing or contains no usable entries, `--prompt` is omitted entirely.
 
 ## Durability contract
 
