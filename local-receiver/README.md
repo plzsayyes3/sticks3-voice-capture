@@ -69,7 +69,38 @@ The real dictionary is ignored by Git so names or other personal vocabulary do
 not get committed accidentally. Copy `transcription-dictionary.example.txt`
 to `transcription-dictionary.txt` and edit it locally. To keep the file
 elsewhere, set `WHISPER_DICTIONARY` to an absolute path. If the file is
-missing or contains no usable entries, `--prompt` is omitted entirely.
+missing or contains no usable entries, the manual layer contributes nothing.
+
+### Automatic vocabulary from my-storage-note
+
+The receiver also reads `my-storage-note/memory/entities/index.json` and adds a
+filtered set of Entity names after the manual terms. It first looks for a
+`my-storage-note` repository beside `sticks3-voice-capture`. If the clone
+lives elsewhere, set `MY_STORAGE_NOTE_PATH`. If no local clone is available,
+the receiver can use the GitHub Contents API with
+`KNOWLEDGE_GITHUB_TOKEN` (falling back to `GITHUB_TOKEN`).
+
+The automatic layer is deliberately conservative:
+
+- kinds: `person`, `organization`, `place`, `concept`
+- canonical `name` only by default; aliases are opt-in because Entity aliases
+  can contain extraction noise
+- one-off entities are included when seen within the recent window (180 days by
+  default)
+- older entities require at least two mentions
+- one-character/noise names are rejected
+- results are ranked toward recent vocabulary and capped by both term count and
+  character budget before being added to Whisper's `--prompt`
+
+Manual terms always come first, so they take priority when the prompt budget is
+tight. The selected automatic vocabulary is written for inspection to
+`STICKS3_DATA_DIR/transcription-dictionary.auto.txt`. It is refreshed every
+six hours by default. If the Knowledge System cannot be read, transcription
+continues with the manual dictionary (and the last good cached Entity terms, if
+available).
+
+The auto vocabulary is still only a Whisper recognition hint. It never rewrites
+the resulting transcript.
 
 ## Durability contract
 
@@ -95,6 +126,7 @@ STICKS3_DATA_DIR/  (default: ~/sticks3-voice-capture-data)
   recordings/<id>.ogg     raw upload
   metadata/<id>.json      sha256, received_at
   transcripts/<id>.txt    verbatim Whisper output
+  transcription-dictionary.auto.txt  inspected auto-selected Entity vocabulary
   notes/<id>.md           rendered Markdown pushed to mynotebook
   done/<id>.json          completion marker + mynotebook push status
 ```

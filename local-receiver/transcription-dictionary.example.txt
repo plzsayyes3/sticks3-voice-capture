@@ -3,6 +3,8 @@
 #
 # Keep personal names or workplace-specific vocabulary only in the local
 # transcription-dictionary.txt file; that file is intentionally gitignored.
+# Manual terms are placed before automatically selected my-storage-note Entity
+# names, so use this file for spellings that must get first priority.
 
 StickS3
 M5Stack

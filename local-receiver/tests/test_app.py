@@ -9,8 +9,11 @@ that still needs a manual run against whisper-cli (see README).
 import importlib
 import threading
 import time
+from datetime import date
 
 import pytest
+
+import entity_dictionary
 
 DEVICE_TOKEN = "test-token-not-a-real-secret"
 
@@ -20,6 +23,8 @@ def app_module(tmp_path, monkeypatch):
     monkeypatch.setenv("STICKS3_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DEVICE_TOKEN", DEVICE_TOKEN)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("KNOWLEDGE_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("ENTITY_DICTIONARY_ENABLED", "0")
 
     import app as app_module  # noqa: PLC0415
     importlib.reload(app_module)
@@ -214,3 +219,144 @@ def test_whisper_command_includes_dictionary_prompt(app_module, tmp_path, monkey
 
     prompt_index = cmd.index("--prompt")
     assert cmd[prompt_index + 1] == "StickS3、M5Stack、Obsidian"
+
+
+def test_entity_selection_keeps_recent_one_off_and_repeated_history():
+    index_data = {
+        "entities": [
+            {
+                "kind": "person",
+                "name": "新しい先生",
+                "aliases": [],
+                "mention_count": 1,
+                "last_seen": "2026-09-10",
+            },
+            {
+                "kind": "concept",
+                "name": "Obsidian",
+                "aliases": ["オブシディアン"],
+                "mention_count": 20,
+                "last_seen": "2021-01-01",
+            },
+            {
+                "kind": "organization",
+                "name": "古い一回だけ",
+                "aliases": [],
+                "mention_count": 1,
+                "last_seen": "2020-01-01",
+            },
+            {
+                "kind": "organization",
+                "name": "田",
+                "aliases": [],
+                "mention_count": 99,
+                "last_seen": "2026-09-10",
+            },
+            {
+                "kind": "event",
+                "name": "運動会",
+                "aliases": [],
+                "mention_count": 99,
+                "last_seen": "2026-09-10",
+            },
+        ]
+    }
+
+    terms = entity_dictionary.select_entity_terms(
+        index_data,
+        today=date(2026, 9, 18),
+        recent_days=180,
+        min_mentions=2,
+        max_terms=20,
+        max_chars=200,
+    )
+
+    assert "新しい先生" in terms
+    assert "Obsidian" in terms
+    assert "古い一回だけ" not in terms
+    assert "田" not in terms
+    assert "運動会" not in terms
+
+
+def test_entity_aliases_are_opt_in():
+    index_data = {
+        "entities": [
+            {
+                "kind": "concept",
+                "name": "Obsidian",
+                "aliases": ["オブシディアン", "シリアン"],
+                "mention_count": 3,
+                "last_seen": "2026-09-17",
+            }
+        ]
+    }
+
+    default_terms = entity_dictionary.select_entity_terms(
+        index_data,
+        today=date(2026, 9, 18),
+        max_chars=200,
+    )
+    alias_terms = entity_dictionary.select_entity_terms(
+        index_data,
+        today=date(2026, 9, 18),
+        include_aliases=True,
+        max_chars=200,
+    )
+
+    assert default_terms == ["Obsidian"]
+    assert alias_terms == ["Obsidian", "オブシディアン", "シリアン"]
+
+
+def test_entity_selection_respects_prompt_budget():
+    index_data = {
+        "entities": [
+            {
+                "kind": "concept",
+                "name": name,
+                "aliases": [],
+                "mention_count": 3,
+                "last_seen": "2026-09-17",
+            }
+            for name in ["Alpha", "Bravo", "Charlie", "Delta"]
+        ]
+    }
+
+    terms = entity_dictionary.select_entity_terms(
+        index_data,
+        today=date(2026, 9, 18),
+        max_terms=2,
+        max_chars=100,
+    )
+
+    assert len(terms) == 2
+
+
+def test_manual_dictionary_precedes_auto_terms(app_module, tmp_path, monkeypatch):
+    dictionary = tmp_path / "dictionary.txt"
+    dictionary.write_text("TaskLiner\nObsidian\n", encoding="utf-8")
+    monkeypatch.setattr(
+        app_module,
+        "load_entity_dictionary_terms",
+        lambda force=False: ["Obsidian", "扇こころ保育園", "足立区"],
+    )
+
+    prompt = app_module.load_transcription_prompt(dictionary)
+
+    assert prompt == "TaskLiner、Obsidian、扇こころ保育園、足立区"
+
+
+def test_entity_dictionary_failure_keeps_previous_cache(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "ENTITY_DICTIONARY_ENABLED", True)
+    monkeypatch.setattr(app_module, "ENTITY_DICTIONARY_REFRESH_SECONDS", 60)
+    app_module._entity_dictionary_cache.update(
+        terms=["既存語"],
+        source="test",
+        expires_at=0.0,
+    )
+
+    def fail(_anchor):
+        raise RuntimeError("temporary source failure")
+
+    monkeypatch.setattr(app_module.entity_dictionary, "load_terms_from_environment", fail)
+
+    assert app_module.load_entity_dictionary_terms(force=True) == ["既存語"]

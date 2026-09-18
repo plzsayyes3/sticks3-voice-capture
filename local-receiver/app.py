@@ -8,12 +8,15 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, abort, jsonify, request
+
+import entity_dictionary
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
@@ -51,6 +54,19 @@ WHISPER_DICTIONARY = Path(os.getenv(
     "WHISPER_DICTIONARY",
     str(Path(__file__).with_name("transcription-dictionary.txt")),
 ))
+WHISPER_PROMPT_MAX_TERMS = int(os.getenv("WHISPER_PROMPT_MAX_TERMS", "80"))
+WHISPER_PROMPT_MAX_CHARS = int(os.getenv("WHISPER_PROMPT_MAX_CHARS", "320"))
+ENTITY_DICTIONARY_ENABLED = entity_dictionary.env_bool("ENTITY_DICTIONARY_ENABLED", True)
+ENTITY_DICTIONARY_REFRESH_SECONDS = int(
+    os.getenv("ENTITY_DICTIONARY_REFRESH_SECONDS", str(6 * 60 * 60))
+)
+AUTO_DICTIONARY_PATH = DATA_DIR / "transcription-dictionary.auto.txt"
+_entity_dictionary_lock = threading.Lock()
+_entity_dictionary_cache = {
+    "terms": [],
+    "source": "uninitialized",
+    "expires_at": 0.0,
+}
 # Metal (GPU) whisper-cli aborts with SIGABRT on this Mac; default to CPU
 # (-ng / no-GPU) until that's root-caused. Set WHISPER_USE_GPU=1 to opt
 # back into Metal once it's fixed or on a machine where it works.
@@ -113,29 +129,105 @@ def store_recording_durably(recording_id: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
-def load_transcription_prompt(path: Path | None = None) -> str:
-    """Load one preferred term per line for whisper.cpp's initial prompt.
-
-    Blank lines and # comments are ignored. Duplicate entries are removed while
-    preserving order. Missing dictionary files intentionally mean "no prompt"
-    so existing installations keep their current behaviour until opted in.
-    """
-    dictionary_path = path or WHISPER_DICTIONARY
+def load_dictionary_terms(path: Path) -> list[str]:
+    """Load one preferred term per line from a local manual dictionary."""
     try:
-        lines = dictionary_path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return ""
+        return []
 
     entries = []
     seen = set()
     for raw_line in lines:
-        entry = raw_line.strip()
+        entry = " ".join(raw_line.strip().split())
         if not entry or entry.startswith("#") or entry in seen:
             continue
         seen.add(entry)
         entries.append(entry)
+    return entries
 
-    return "、".join(entries)
+
+def load_entity_dictionary_terms(force: bool = False) -> list[str]:
+    """Return cached my-storage-note Entity terms without risking transcription.
+
+    Refresh failures keep the last good cache. This makes Knowledge System
+    access advisory: a private-repo auth problem must never block a recording.
+    """
+    if not ENTITY_DICTIONARY_ENABLED:
+        return []
+
+    now = time.monotonic()
+    with _entity_dictionary_lock:
+        expires_at = float(_entity_dictionary_cache["expires_at"])
+        if not force and now < expires_at:
+            return list(_entity_dictionary_cache["terms"])
+
+        previous_terms = list(_entity_dictionary_cache["terms"])
+        try:
+            terms, source = entity_dictionary.load_terms_from_environment(Path(__file__))
+            _entity_dictionary_cache.update(
+                terms=terms,
+                source=source,
+                expires_at=now + max(60, ENTITY_DICTIONARY_REFRESH_SECONDS),
+            )
+            if terms:
+                atomic_write_text(
+                    AUTO_DICTIONARY_PATH,
+                    "# Auto-generated from my-storage-note/memory/entities/index.json\n"
+                    f"# source: {source}\n"
+                    + "\n".join(terms)
+                    + "\n",
+                )
+                app.logger.info(
+                    "loaded %d auto transcription terms from %s",
+                    len(terms),
+                    source,
+                )
+            elif source != "unavailable":
+                app.logger.info("Entity dictionary source %s produced no terms", source)
+            return list(terms)
+        except Exception as exc:
+            # Retry sooner after an outage, but preserve any previously-good set.
+            _entity_dictionary_cache["expires_at"] = now + min(
+                300,
+                max(60, ENTITY_DICTIONARY_REFRESH_SECONDS),
+            )
+            app.logger.warning("Entity dictionary refresh failed: %s", exc)
+            return previous_terms
+
+
+def _merge_prompt_terms(*term_groups: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    used_chars = 0
+
+    for group in term_groups:
+        for raw_term in group:
+            term = " ".join(raw_term.strip().split())
+            if not term or term in seen:
+                continue
+            extra_chars = len(term) + (1 if result else 0)
+            if len(result) >= WHISPER_PROMPT_MAX_TERMS:
+                return result
+            if used_chars + extra_chars > WHISPER_PROMPT_MAX_CHARS:
+                return result
+            seen.add(term)
+            result.append(term)
+            used_chars += extra_chars
+
+    return result
+
+
+def load_transcription_prompt(path: Path | None = None) -> str:
+    """Merge manual vocabulary with filtered my-storage-note Entity names.
+
+    Manual terms are first and therefore win the limited prompt budget.
+    The auto layer is advisory and is omitted when no source is available.
+    """
+    dictionary_path = path or WHISPER_DICTIONARY
+    manual_terms = load_dictionary_terms(dictionary_path)
+    auto_terms = load_entity_dictionary_terms()
+    return "、".join(_merge_prompt_terms(manual_terms, auto_terms))
 
 
 def build_whisper_command(wav_path: Path, out_prefix: Path) -> list[str]:
