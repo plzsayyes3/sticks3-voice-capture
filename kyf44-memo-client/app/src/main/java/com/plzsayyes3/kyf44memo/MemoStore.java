@@ -105,6 +105,9 @@ final class MemoStore {
         if (!endpoint.startsWith("https://")) {
             throw new IllegalStateException("HTTPS receiver URL is required");
         }
+        if (endpoint.endsWith("/v1/recordings")) {
+            endpoint = endpoint.substring(0, endpoint.length() - "/v1/recordings".length());
+        }
         if (!endpoint.endsWith("/v1/memos")) {
             endpoint += "/v1/memos";
         }
