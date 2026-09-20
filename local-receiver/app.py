@@ -20,6 +20,7 @@ import entity_dictionary
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+MAX_MEMO_BYTES = int(os.getenv("MAX_MEMO_BYTES", str(16 * 1024)))
 
 # GitHub's Contents API writes update a single mutable branch ref, so two
 # concurrent pushes race even when they touch different files — the loser
@@ -34,6 +35,9 @@ _mynotebook_push_lock = threading.Lock()
 # CPU/GPU and memory. A single persistent worker processes recordings
 # strictly one at a time; the queue absorbs bursts instead.
 _processing_queue: "queue.Queue[str]" = queue.Queue()
+# Text memos do not need Whisper, so keep them on a separate lightweight queue.
+# This prevents a long transcription from delaying a typed KYF44 capture.
+_memo_processing_queue: "queue.Queue[str]" = queue.Queue()
 
 RECORDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 ALLOWED_AUDIO_TYPES = {"audio/ogg", "audio/opus", "application/ogg"}
@@ -45,6 +49,9 @@ TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 NOTES_DIR = DATA_DIR / "notes"
 DONE_DIR = DATA_DIR / "done"
 METADATA_DIR = DATA_DIR / "metadata"
+MEMOS_DIR = DATA_DIR / "memos"
+MEMO_METADATA_DIR = DATA_DIR / "memo-metadata"
+MEMO_DONE_DIR = DATA_DIR / "memo-done"
 
 WHISPER_BIN = os.getenv("WHISPER_CLI", "whisper-cli")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", str(Path.home() / "whisper-models" / "ggml-large-v3-turbo.bin"))
@@ -72,7 +79,10 @@ _entity_dictionary_cache = {
 # back into Metal once it's fixed or on a machine where it works.
 WHISPER_USE_GPU = os.getenv("WHISPER_USE_GPU", "0").strip() not in ("", "0", "false", "False")
 
-for _dir in (RECORDINGS_DIR, TRANSCRIPTS_DIR, NOTES_DIR, DONE_DIR, METADATA_DIR):
+for _dir in (
+    RECORDINGS_DIR, TRANSCRIPTS_DIR, NOTES_DIR, DONE_DIR, METADATA_DIR,
+    MEMOS_DIR, MEMO_METADATA_DIR, MEMO_DONE_DIR,
+):
     _dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -83,14 +93,29 @@ def env_required(name: str) -> str:
     return value
 
 
-def require_device_token() -> None:
-    expected = env_required("DEVICE_TOKEN")
+def require_bearer_token(env_name: str, fallback_env: str | None = None) -> None:
+    expected = os.getenv(env_name, "").strip()
+    if not expected and fallback_env:
+        expected = os.getenv(fallback_env, "").strip()
+    if not expected:
+        raise RuntimeError(f"missing required environment variable: {env_name}")
+
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         abort(401)
     supplied = header[7:]
     if not hmac.compare_digest(supplied, expected):
         abort(403)
+
+
+def require_device_token() -> None:
+    require_bearer_token("DEVICE_TOKEN")
+
+
+def require_memo_device_token() -> None:
+    # A distinct KYF44 token is recommended so a lost phone can be revoked
+    # without touching StickS3 sync. DEVICE_TOKEN remains a compatibility fallback.
+    require_bearer_token("KYF44_DEVICE_TOKEN", fallback_env="DEVICE_TOKEN")
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -117,6 +142,32 @@ def write_metadata(recording_id: str, metadata: dict) -> None:
         metadata_path(recording_id),
         json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
     )
+
+
+def memo_metadata_path(memo_id: str) -> Path:
+    return MEMO_METADATA_DIR / f"{memo_id}.json"
+
+
+def read_memo_metadata(memo_id: str):
+    path = memo_metadata_path(memo_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_memo_metadata(memo_id: str, metadata: dict) -> None:
+    atomic_write_text(
+        memo_metadata_path(memo_id),
+        json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def store_memo_durably(memo_id: str, data: bytes) -> None:
+    memo_path = MEMOS_DIR / f"{memo_id}.txt"
+    with open(memo_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def store_recording_durably(recording_id: str, data: bytes) -> None:
@@ -301,6 +352,18 @@ def mynotebook_path(recording_id: str, received_at: str) -> str:
     return f"{prefix}/{stamp}-sticks3-{recording_id}.md"
 
 
+def memo_mynotebook_path(memo_id: str, received_at: str) -> str:
+    dt = datetime.fromisoformat(received_at.replace("Z", "+00:00")).astimezone(JST)
+    stamp = dt.strftime("%Y%m%d%H%M%S")
+    prefix = os.getenv("MYNOTEBOOK_PATH_PREFIX", "00_inbox").strip("/")
+    return f"{prefix}/{stamp}-kyf44-{memo_id}.md"
+
+
+def render_memo_markdown(text: str) -> str:
+    # Keep typed capture verbatim; the filename records the source and timestamp.
+    return text if text.endswith("\n") else text + "\n"
+
+
 def push_to_mynotebook(path: str, markdown: str) -> str:
     token = os.getenv("GITHUB_TOKEN", "").strip()
     if not token:
@@ -321,8 +384,10 @@ def push_to_mynotebook(path: str, markdown: str) -> str:
     if existing.status_code != 404:
         raise RuntimeError(f"GitHub lookup failed: {existing.status_code} {existing.text[:300]}")
 
+    filename = path.rsplit("/", 1)[-1]
+    capture_type = "KYF44 memo" if "-kyf44-" in filename else "StickS3 voice capture"
     body = {
-        "message": f"Add StickS3 voice capture {path.rsplit('/', 1)[-1]}",
+        "message": f"Add {capture_type} {filename}",
         "content": base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
         "branch": branch,
     }
@@ -372,6 +437,33 @@ def process_recording_async(recording_id: str) -> None:
         app.logger.exception("processing failed for %s", recording_id)
 
 
+def process_memo_async(memo_id: str) -> None:
+    try:
+        metadata = read_memo_metadata(memo_id)
+        memo_path = MEMOS_DIR / f"{memo_id}.txt"
+        text = memo_path.read_text(encoding="utf-8")
+        markdown = render_memo_markdown(text)
+        notebook_path = memo_mynotebook_path(memo_id, metadata["received_at"])
+
+        with _mynotebook_push_lock:
+            notebook_status = push_to_mynotebook(notebook_path, markdown)
+
+        atomic_write_text(
+            MEMO_DONE_DIR / f"{memo_id}.json",
+            json.dumps(
+                {
+                    "memo_id": memo_id,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "mynotebook_path": notebook_path,
+                    "mynotebook_status": notebook_status,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:
+        app.logger.exception("memo processing failed for %s", memo_id)
+
+
 def _processing_worker_loop() -> None:
     while True:
         recording_id = _processing_queue.get()
@@ -381,7 +473,17 @@ def _processing_worker_loop() -> None:
             _processing_queue.task_done()
 
 
+def _memo_processing_worker_loop() -> None:
+    while True:
+        memo_id = _memo_processing_queue.get()
+        try:
+            process_memo_async(memo_id)
+        finally:
+            _memo_processing_queue.task_done()
+
+
 threading.Thread(target=_processing_worker_loop, daemon=True).start()
+threading.Thread(target=_memo_processing_worker_loop, daemon=True).start()
 
 
 def reprocess_pending_recordings() -> None:
@@ -396,6 +498,16 @@ def reprocess_pending_recordings() -> None:
             continue
         app.logger.info("resuming unfinished recording %s from startup scan", recording_id)
         _processing_queue.put(recording_id)
+
+
+def reprocess_pending_memos() -> None:
+    """Resume typed captures that were durably accepted but not pushed yet."""
+    for meta_path in MEMO_METADATA_DIR.glob("*.json"):
+        memo_id = meta_path.stem
+        if (MEMO_DONE_DIR / f"{memo_id}.json").exists():
+            continue
+        app.logger.info("resuming unfinished memo %s from startup scan", memo_id)
+        _memo_processing_queue.put(memo_id)
 
 
 @app.get("/health")
@@ -456,6 +568,62 @@ def receive_recording():
     ), 200 if duplicate else 201
 
 
+@app.post("/v1/memos")
+def receive_memo():
+    require_memo_device_token()
+
+    memo_id = request.headers.get("X-Memo-ID", "").strip()
+    if not RECORDING_ID_RE.fullmatch(memo_id):
+        return jsonify({"ok": False, "error": "invalid_memo_id"}), 400
+
+    content_type = (request.mimetype or "").lower()
+    if content_type != "text/plain":
+        return jsonify({"ok": False, "error": "unsupported_content_type"}), 415
+
+    data = request.get_data(cache=False, as_text=False)
+    if not data:
+        return jsonify({"ok": False, "error": "empty_body"}), 400
+    if len(data) > MAX_MEMO_BYTES:
+        return jsonify({"ok": False, "error": "memo_too_large"}), 413
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return jsonify({"ok": False, "error": "invalid_utf8"}), 400
+    if not text.strip():
+        return jsonify({"ok": False, "error": "empty_body"}), 400
+
+    sha256 = hashlib.sha256(data).hexdigest()
+    existing = read_memo_metadata(memo_id)
+    if existing is not None:
+        if not hmac.compare_digest(existing.get("sha256", ""), sha256):
+            return jsonify({"ok": False, "error": "memo_id_conflict"}), 409
+        duplicate = True
+    else:
+        duplicate = False
+        received_at = datetime.now(timezone.utc).isoformat()
+        store_memo_durably(memo_id, data)
+        write_memo_metadata(
+            memo_id,
+            {
+                "memo_id": memo_id,
+                "sha256": sha256,
+                "received_at": received_at,
+                "source": "kyf44",
+            },
+        )
+
+    _memo_processing_queue.put(memo_id)
+    return jsonify(
+        {
+            "ok": True,
+            "memo_id": memo_id,
+            "status": "already_stored" if duplicate else "stored",
+            "sha256": sha256,
+        }
+    ), 200 if duplicate else 201
+
+
 @app.errorhandler(413)
 def too_large(_error):
     return jsonify({"ok": False, "error": "upload_too_large"}), 413
@@ -463,5 +631,6 @@ def too_large(_error):
 
 if __name__ == "__main__":
     reprocess_pending_recordings()
+    reprocess_pending_memos()
     port = int(os.getenv("PORT", "8090"))
     app.run(host="0.0.0.0", port=port)
