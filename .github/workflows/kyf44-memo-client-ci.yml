@@ -1,0 +1,37 @@
+name: KYF44 Memo Client CI
+
+on:
+  push:
+    paths:
+      - "kyf44-memo-client/**"
+      - ".github/workflows/kyf44-memo-client-ci.yml"
+  pull_request:
+    paths:
+      - "kyf44-memo-client/**"
+      - ".github/workflows/kyf44-memo-client-ci.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build debug APK
+        working-directory: kyf44-memo-client
+        run: gradle :app:assembleDebug
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: kyf44-memo-debug-apk
+          path: kyf44-memo-client/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

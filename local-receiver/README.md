@@ -3,7 +3,8 @@
 Receives Ogg/Opus recordings uploaded by the StickS3 over Wi-Fi (the side-button
 Sync flow), transcribes them locally with [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
 and pushes the verbatim transcript straight into `mynotebook/00_inbox` — no
-summarization step.
+summarization step. The same receiver also accepts typed captures from a KYF44
+at `POST /v1/memos`, so voice and text share the same durable Inbox pipeline.
 
 This replaces the Cloud Run / Cloud Storage / Pub/Sub / Gemini design from
 `feature/cloud-receiver-api` (PR #2), which is on hold. The HTTP API shape
@@ -39,7 +40,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 cp transcription-dictionary.example.txt transcription-dictionary.txt
-# edit .env: set DEVICE_TOKEN, optionally GITHUB_TOKEN
+# edit .env: set DEVICE_TOKEN, optionally KYF44_DEVICE_TOKEN and GITHUB_TOKEN
 # edit transcription-dictionary.txt: add one preferred term per line
 ```
 
@@ -129,4 +130,48 @@ STICKS3_DATA_DIR/  (default: ~/sticks3-voice-capture-data)
   transcription-dictionary.auto.txt  inspected auto-selected Entity vocabulary
   notes/<id>.md           rendered Markdown pushed to mynotebook
   done/<id>.json          completion marker + mynotebook push status
+  memos/<id>.txt           verbatim KYF44 typed capture
+  memo-metadata/<id>.json  KYF44 sha256, received_at
+  memo-done/<id>.json      KYF44 completion marker + push status
 ```
+
+
+## KYF44 typed memo endpoint
+
+The KYF44 client uses the same capture-first contract as StickS3, but skips
+Whisper entirely:
+
+```text
+KYF44
+  -> POST /v1/memos
+  -> fsync local text + atomic metadata
+  -> 201 Stored
+  -> background GitHub Contents API push
+  -> mynotebook/00_inbox/<timestamp>-kyf44-<memo-id>.md
+```
+
+Request:
+
+```http
+POST /v1/memos
+Authorization: Bearer <KYF44_DEVICE_TOKEN>
+X-Memo-ID: <stable id for this local memo>
+Content-Type: text/plain; charset=utf-8
+
+日本語のメモ本文
+```
+
+`KYF44_DEVICE_TOKEN` is intentionally separate from `GITHUB_TOKEN`. The phone
+never needs the GitHub credential. If `KYF44_DEVICE_TOKEN` is unset, the
+receiver falls back to `DEVICE_TOKEN` for initial setup compatibility, but a
+separate random token is recommended for normal use.
+
+The receiver accepts at most `MAX_MEMO_BYTES` bytes per memo (16 KiB by
+default), validates UTF-8, and uses the same SHA-256 idempotency rule as voice:
+same ID + same bytes returns 200; same ID + different bytes returns 409.
+
+The original typed text is stored verbatim under
+`STICKS3_DATA_DIR/memos/<id>.txt`. A 201 response means the memo body has been
+fsynced and its metadata written atomically; GitHub can be temporarily offline
+without losing the capture. Pending GitHub pushes are resumed on receiver
+restart.

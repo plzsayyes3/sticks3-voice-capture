@@ -16,12 +16,14 @@ import pytest
 import entity_dictionary
 
 DEVICE_TOKEN = "test-token-not-a-real-secret"
+KYF44_TOKEN = "test-kyf44-token-not-a-real-secret"
 
 
 @pytest.fixture
 def app_module(tmp_path, monkeypatch):
     monkeypatch.setenv("STICKS3_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DEVICE_TOKEN", DEVICE_TOKEN)
+    monkeypatch.setenv("KYF44_DEVICE_TOKEN", KYF44_TOKEN)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("KNOWLEDGE_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("ENTITY_DICTIONARY_ENABLED", "0")
@@ -52,6 +54,24 @@ def auth_headers(recording_id: str, token: str = DEVICE_TOKEN) -> dict:
 def wait_for_done(app_module, recording_id: str, timeout: float = 2.0) -> bool:
     deadline = time.monotonic() + timeout
     done_path = app_module.DONE_DIR / f"{recording_id}.json"
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def memo_headers(memo_id: str, token: str = KYF44_TOKEN) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Memo-ID": memo_id,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+
+
+def wait_for_memo_done(app_module, memo_id: str, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    done_path = app_module.MEMO_DONE_DIR / f"{memo_id}.json"
     while time.monotonic() < deadline:
         if done_path.exists():
             return True
@@ -360,3 +380,147 @@ def test_entity_dictionary_failure_keeps_previous_cache(app_module, monkeypatch)
     monkeypatch.setattr(app_module.entity_dictionary, "load_terms_from_environment", fail)
 
     assert app_module.load_entity_dictionary_terms(force=True) == ["既存語"]
+
+
+def test_memo_missing_auth_rejected(client):
+    resp = client.post(
+        "/v1/memos",
+        data="日本語メモ".encode("utf-8"),
+        headers={"X-Memo-ID": "memo-001", "Content-Type": "text/plain"},
+    )
+    assert resp.status_code == 401
+
+
+def test_memo_wrong_token_rejected(client):
+    resp = client.post(
+        "/v1/memos",
+        data="日本語メモ".encode("utf-8"),
+        headers=memo_headers("memo-002", token="wrong"),
+    )
+    assert resp.status_code == 403
+
+
+def test_memo_validates_id_content_type_and_utf8(client):
+    bad_id = client.post(
+        "/v1/memos",
+        data="メモ".encode("utf-8"),
+        headers=memo_headers("../../bad"),
+    )
+    assert bad_id.status_code == 400
+    assert bad_id.get_json()["error"] == "invalid_memo_id"
+
+    bad_type_headers = memo_headers("memo-003")
+    bad_type_headers["Content-Type"] = "application/json"
+    bad_type = client.post("/v1/memos", data=b"{}", headers=bad_type_headers)
+    assert bad_type.status_code == 415
+
+    bad_utf8 = client.post("/v1/memos", data=b"\xff\xfe", headers=memo_headers("memo-004"))
+    assert bad_utf8.status_code == 400
+    assert bad_utf8.get_json()["error"] == "invalid_utf8"
+
+
+def test_memo_empty_and_size_limit(client, app_module, monkeypatch):
+    empty = client.post("/v1/memos", data=b"", headers=memo_headers("memo-005"))
+    assert empty.status_code == 400
+
+    whitespace = client.post(
+        "/v1/memos",
+        data="   \n".encode("utf-8"),
+        headers=memo_headers("memo-006"),
+    )
+    assert whitespace.status_code == 400
+
+    monkeypatch.setattr(app_module, "MAX_MEMO_BYTES", 4)
+    too_large = client.post(
+        "/v1/memos",
+        data="あいう".encode("utf-8"),
+        headers=memo_headers("memo-007"),
+    )
+    assert too_large.status_code == 413
+    assert too_large.get_json()["error"] == "memo_too_large"
+
+
+def test_new_memo_is_durably_stored_and_pushed(client, app_module):
+    text = "KYF44からの日本語メモ"
+    resp = client.post(
+        "/v1/memos",
+        data=text.encode("utf-8"),
+        headers=memo_headers("memo-008"),
+    )
+    assert resp.status_code == 201
+    assert resp.get_json()["status"] == "stored"
+
+    memo_file = app_module.MEMOS_DIR / "memo-008.txt"
+    assert memo_file.read_text(encoding="utf-8") == text
+    metadata = app_module.read_memo_metadata("memo-008")
+    assert metadata["source"] == "kyf44"
+
+    assert wait_for_memo_done(app_module, "memo-008")
+    done = app_module.MEMO_DONE_DIR / "memo-008.json"
+    payload = __import__("json").loads(done.read_text(encoding="utf-8"))
+    assert "-kyf44-memo-008.md" in payload["mynotebook_path"]
+
+
+def test_duplicate_memo_is_idempotent_and_conflict_is_rejected(client, app_module):
+    data = "同じメモ".encode("utf-8")
+    first = client.post("/v1/memos", data=data, headers=memo_headers("memo-009"))
+    assert first.status_code == 201
+
+    duplicate = client.post("/v1/memos", data=data, headers=memo_headers("memo-009"))
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()["status"] == "already_stored"
+
+    conflict = client.post(
+        "/v1/memos",
+        data="別の内容".encode("utf-8"),
+        headers=memo_headers("memo-009"),
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["error"] == "memo_id_conflict"
+
+    assert wait_for_memo_done(app_module, "memo-009")
+
+
+def test_reprocess_pending_memos_resumes_unfinished(app_module):
+    memo_id = "memo-crash-before-done"
+    data = "再送されるメモ".encode("utf-8")
+    app_module.store_memo_durably(memo_id, data)
+    app_module.write_memo_metadata(
+        memo_id,
+        {
+            "memo_id": memo_id,
+            "sha256": "irrelevant-for-this-test",
+            "received_at": "2026-09-20T08:00:00+00:00",
+            "source": "kyf44",
+        },
+    )
+    assert not (app_module.MEMO_DONE_DIR / f"{memo_id}.json").exists()
+
+    app_module.reprocess_pending_memos()
+
+    assert wait_for_memo_done(app_module, memo_id)
+
+
+def test_kyf44_token_falls_back_to_device_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("STICKS3_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DEVICE_TOKEN", DEVICE_TOKEN)
+    monkeypatch.delenv("KYF44_DEVICE_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("ENTITY_DICTIONARY_ENABLED", "0")
+
+    import app as app_module  # noqa: PLC0415
+    importlib.reload(app_module)
+    monkeypatch.setattr(app_module, "push_to_mynotebook", lambda path, markdown: "created")
+    app_module.app.testing = True
+
+    with app_module.app.test_client() as fallback_client:
+        resp = fallback_client.post(
+            "/v1/memos",
+            data="fallback".encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {DEVICE_TOKEN}",
+                "X-Memo-ID": "memo-fallback",
+                "Content-Type": "text/plain",
+            },
+        )
+    assert resp.status_code == 201
