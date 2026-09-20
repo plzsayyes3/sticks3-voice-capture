@@ -130,6 +130,9 @@ STICKS3_DATA_DIR/  (default: ~/sticks3-voice-capture-data)
   transcription-dictionary.auto.txt  inspected auto-selected Entity vocabulary
   notes/<id>.md           rendered Markdown pushed to mynotebook
   done/<id>.json          completion marker + mynotebook push status
+  memos/<id>.txt           verbatim KYF44 typed capture
+  memo-metadata/<id>.json  KYF44 sha256, received_at
+  memo-done/<id>.json      KYF44 completion marker + push status
 ```
 
 
@@ -141,7 +144,7 @@ Whisper entirely:
 ```text
 KYF44
   -> POST /v1/memos
-  -> fsync local text + metadata
+  -> fsync local text + atomic metadata
   -> 201 Stored
   -> background GitHub Contents API push
   -> mynotebook/00_inbox/<timestamp>-kyf44-<memo-id>.md
@@ -168,7 +171,7 @@ default), validates UTF-8, and uses the same SHA-256 idempotency rule as voice:
 same ID + same bytes returns 200; same ID + different bytes returns 409.
 
 The original typed text is stored verbatim under
-`STICKS3_DATA_DIR/memos/<id>.txt`. A 201 response means that local copy and its
-metadata have already been flushed to disk; GitHub can be temporarily offline
+`STICKS3_DATA_DIR/memos/<id>.txt`. A 201 response means the memo body has been
+fsynced and its metadata written atomically; GitHub can be temporarily offline
 without losing the capture. Pending GitHub pushes are resumed on receiver
 restart.
