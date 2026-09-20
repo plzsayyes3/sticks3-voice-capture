@@ -44,7 +44,7 @@ final class MemoStore {
         return files == null ? 0 : files.length;
     }
 
-    static int syncAll(Context context) throws IOException {
+    static synchronized int syncAll(Context context) throws IOException {
         String endpoint = normalizeEndpoint(SecretStore.getEndpoint(context));
         String token = SecretStore.getToken(context);
         if (endpoint.isEmpty() || token.isEmpty()) {
