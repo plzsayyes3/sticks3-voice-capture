@@ -25,8 +25,13 @@ StickS3                          Mac(local-receiver)
 実再生、reboot後保持、20分連続録音、強制reset耐性、`.part`回収)に合格しています。
 
 既知の制約:
-- firmwareイメージは2MiB OTAスロットの残り約2%まで来ており、今後の機能追加前に
-  `sdkconfig`での容量最適化が必要になる見込みです。
+- OTAスロットは各約2.69MiB(0x2b0000)、本体の録音領域`storage`は約2.56MB
+  (0x290000、20kbps Opusで約17分)です。録音はTF HATのSDカードが優先です。
+- パーティション表を変えた版を初めて書き込むときは、`storage`の旧データが残って
+  マウントに失敗するため、先に本体の録音をWi-Fi同期で送り切ってから、USBで
+  `idf.py -p PORT flash` と
+  `python -m esptool --chip esp32s3 -p PORT erase_region 0x570000 0x290000`
+  を実行してください(初回起動時に空の領域としてFATが作成されます)。
 - `light_sleep_enable`はUSB-Serial-JTAGのdebug安定性のため強制的に`false`にして
   います。正確なバッテリー駆動時間を測るには本番向けに戻す必要があります。
 - 外出先からの同期は、自分で用意したTailscale FunnelのURLに依存します(下記参照)。

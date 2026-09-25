@@ -35,7 +35,7 @@ static const char *TAG = "wifi_sync";
  * pass (see collect_sync_candidates) instead of mutating entries while
  * readdir() is still iterating the directory, which is unsafe on FATFS
  * (entries can be skipped or re-visited). 48 is far above what the
- * ~3.94MB storage partition holds at typical recording sizes. */
+ * ~2.56MB storage partition holds at typical recording sizes. */
 #define MAX_SYNC_CANDIDATES 48
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -176,7 +176,7 @@ static bool is_pending_recording(const char *name)
 
 /* Recordings synced by firmware before this change were left behind as
  * "<id>.ogg.sent" (renamed, never deleted) and would otherwise sit on the
- * ~3.94MB storage partition forever. These are already confirmed uploaded
+ * ~2.56MB storage partition forever. These are already confirmed uploaded
  * by definition of having been renamed, so sync can just clear them out. */
 static bool is_stale_sent_file(const char *name)
 {
@@ -414,7 +414,7 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
             /* The receiver fsyncs the recording durably and dedupes by
              * SHA-256 before replying 200/201, so a success response means
              * the recording is safe on the Mac. Delete rather than rename
-             * to .sent: the storage partition is only ~3.94MB, and files
+             * to .sent: the storage partition is only ~2.56MB, and files
              * that are merely renamed never free that space. */
             if (remove(full_path) != 0) {
                 ESP_LOGW(TAG, "uploaded %s but delete failed; will retry next sync",

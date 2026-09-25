@@ -38,10 +38,10 @@ jobs:
             image="build/voice_stick.bin"
             test -f "$image"
             size="$(stat -c %s "$image")"
-            limit=$((0x200000))
+            limit=$((0x2b0000))
             echo "firmware image: ${size} bytes; OTA slot limit: ${limit} bytes"
             if [ "$size" -ge "$limit" ]; then
-              echo "::error ::firmware image does not fit the 2 MiB OTA slot"
+              echo "::error ::firmware image does not fit the 2.69 MiB OTA slot"
               exit 1
             fi
             idf.py size
