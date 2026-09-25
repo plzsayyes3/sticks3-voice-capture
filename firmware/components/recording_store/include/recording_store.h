@@ -9,6 +9,12 @@
 
 esp_err_t recording_store_init(void);
 const char *recording_store_base_path(void);
+/* true when recordings go to the TF HAT SD card, false for internal flash */
+bool recording_store_on_sd(void);
+/* While on SD: temporarily mount internal flash to reach recordings made
+ * before the card was used. Returns its directory, or NULL if unavailable. */
+const char *recording_store_open_flash_backlog(void);
+void recording_store_close_flash_backlog(void);
 esp_err_t recording_store_get_usage(uint64_t *used_bytes, uint64_t *capacity_bytes);
 esp_err_t recording_store_begin(uint32_t session_id,
                                 uint32_t input_sample_rate,

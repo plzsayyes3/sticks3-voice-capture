@@ -338,9 +338,23 @@ static void collect_sync_candidates(const char *base_path, sync_candidates_t *ou
     closedir(dir);
 }
 
+static void clear_stale_sent(const char *base_path, const sync_candidates_t *candidates)
+{
+    for (size_t i = 0; i < candidates->stale_sent_count; ++i) {
+        char full_path[PATH_BUFFER_SIZE];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->stale_sent[i]);
+        if (remove(full_path) != 0) {
+            ESP_LOGW(TAG, "failed to clear stale synced file %s", candidates->stale_sent[i]);
+        } else {
+            ESP_LOGI(TAG, "cleared stale synced file %s", candidates->stale_sent[i]);
+        }
+    }
+}
+
 static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed)
 {
     const char *base_path = recording_store_base_path();
+    bool flash_backlog = false;
 
     /* Heap-allocated and freed within this call rather than static/global:
      * a static sync_candidates_t here would permanently reserve ~3.8KB of
@@ -357,14 +371,22 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
         return;
     }
     collect_sync_candidates(base_path, candidates);
+    clear_stale_sent(base_path, candidates);
+    size_t stale_cleared = candidates->stale_sent_count;
 
-    for (size_t i = 0; i < candidates->stale_sent_count; ++i) {
-        char full_path[PATH_BUFFER_SIZE];
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->stale_sent[i]);
-        if (remove(full_path) != 0) {
-            ESP_LOGW(TAG, "failed to clear stale synced file %s", candidates->stale_sent[i]);
-        } else {
-            ESP_LOGI(TAG, "cleared stale synced file %s", candidates->stale_sent[i]);
+    /* Nothing pending on the SD card: look once at internal flash for
+     * recordings made before the card was fitted. Only mounted for this
+     * sync and released again below. */
+    if (candidates->pending_count == 0 && recording_store_on_sd()) {
+        const char *flash_path = recording_store_open_flash_backlog();
+        if (flash_path) {
+            flash_backlog = true;
+            base_path = flash_path;
+            collect_sync_candidates(base_path, candidates);
+            clear_stale_sent(base_path, candidates);
+            stale_cleared += candidates->stale_sent_count;
+            ESP_LOGI(TAG, "SD has nothing pending; %u pending in internal flash",
+                     (unsigned)candidates->pending_count);
         }
     }
 
@@ -405,9 +427,12 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
         }
     }
 
-    ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed, %u stale .sent cleared",
-             uploaded, failed, (unsigned)candidates->stale_sent_count);
+    ESP_LOGI(TAG, "sync complete (%s): %u uploaded, %u failed, %u stale .sent cleared",
+             base_path, uploaded, failed, (unsigned)stale_cleared);
     free(candidates);
+    if (flash_backlog) {
+        recording_store_close_flash_backlog();
+    }
     *out_uploaded = uploaded;
     *out_failed = failed;
 }
