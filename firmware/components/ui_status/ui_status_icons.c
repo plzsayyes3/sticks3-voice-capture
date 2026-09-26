@@ -141,9 +141,25 @@ void ui_status_icons_create(ui_status_icons_t *icons, lv_obj_t *screen)
     lv_obj_align(icons->root, LV_ALIGN_TOP_MID, 0, RADY_ICON_TOP_Y);
 }
 
+/* Last applied bob offset. The exec callback only touches the style (and so
+ * only invalidates/redraws the icon) when the whole-pixel offset changes:
+ * a 2-3px bob redraws a handful of times per cycle instead of every frame,
+ * which matters during hour-long recordings. */
+static int32_t s_bob_offset;
+
+static void bob_exec(void *var, int32_t value)
+{
+    if (value != s_bob_offset) {
+        s_bob_offset = value;
+        lv_obj_set_style_translate_y((lv_obj_t *)var, value, 0);
+    }
+}
+
 void ui_status_icons_stop_anim(ui_status_icons_t *icons)
 {
     lv_anim_delete(icons->root, NULL);
+    s_bob_offset = 0;
+    lv_obj_set_style_translate_y(icons->root, 0, 0);
 }
 
 void ui_status_icons_apply(ui_status_icons_t *icons, ui_status_icon_scene_t scene)
@@ -156,6 +172,36 @@ void ui_status_icons_apply(ui_status_icons_t *icons, ui_status_icon_scene_t scen
 
 void ui_status_icons_start_anim(ui_status_icons_t *icons, ui_status_icon_scene_t scene)
 {
-    (void)icons;
-    (void)scene;
+    /* Rady "breathes" while waiting, bounces while listening and hops while
+     * sending. Other scenes (and the dimmed resting screen) stay still. */
+    int32_t amplitude = 0;
+    uint32_t half_period_ms = 0;
+    switch (scene) {
+    case UI_STATUS_ICON_IDLE:
+        amplitude = 3;
+        half_period_ms = 1600;
+        break;
+    case UI_STATUS_ICON_RECORDING:
+    case UI_STATUS_ICON_RECORDING_SD:
+        amplitude = 3;
+        half_period_ms = 450;
+        break;
+    case UI_STATUS_ICON_WIFI:
+        amplitude = 2;
+        half_period_ms = 700;
+        break;
+    default:
+        return;
+    }
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, icons->root);
+    lv_anim_set_exec_cb(&anim, bob_exec);
+    lv_anim_set_values(&anim, 0, -amplitude);
+    lv_anim_set_duration(&anim, half_period_ms);
+    lv_anim_set_playback_duration(&anim, half_period_ms);
+    lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
+    lv_anim_start(&anim);
 }

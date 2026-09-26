@@ -18,3 +18,4 @@ local-receiver/__pycache__/
 local-receiver/tests/__pycache__/
 local-receiver/.pytest_cache/
 scripts/.icon-venv/
+scripts/.fonts/

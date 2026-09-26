@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/lock.h>
 #include <sys/param.h>
@@ -15,12 +16,14 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "stick_s3_board.h"
+#include "ui_status_font_jp.h"
 #include "ui_status_icons.h"
 
 static const char *TAG = "ui_status";
@@ -46,18 +49,27 @@ static const char *TAG = "ui_status";
 #define LVGL_TASK_STACK_SIZE (5 * 1024)
 #define LVGL_TASK_PRIORITY 2
 
+/* Status (16px, up to 7 full-width characters) sits right under the icon;
+ * the hint (12px, may wrap to two lines) sits above the one-line firmware
+ * version at the very bottom without touching the status. */
+#define UI_STATUS_TOP_Y 156
+#define UI_HINT_BOTTOM_Y (-12)
+/* Storage text shares the top row with the battery on the right. */
+#define UI_STORAGE_LABEL_W 68
+
 #define LCD_BACKLIGHT_LEDC_MODE LEDC_LOW_SPEED_MODE
 #define LCD_BACKLIGHT_LEDC_TIMER LEDC_TIMER_0
 #define LCD_BACKLIGHT_LEDC_CHANNEL LEDC_CHANNEL_0
-#define UI_STATUS_TEXT_MAX 32
+/* Japanese UTF-8 is 3 bytes per character. */
+#define UI_STATUS_TEXT_MAX 48
 #define UI_HINT_TEXT_MAX 96
 
 static _lock_t s_lvgl_lock;
 static bool s_ready;
 static lv_display_t *s_display;
 static lv_obj_t *s_screen;
-static lv_obj_t *s_top_label;
-static lv_obj_t *s_ble_dot;
+static lv_obj_t *s_storage_label;
+static lv_obj_t *s_version_label;
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_hint_label;
 static lv_obj_t *s_battery_shell;
@@ -66,10 +78,10 @@ static lv_obj_t *s_battery_tip;
 static lv_obj_t *s_battery_label;
 static ui_status_icons_t s_icons;
 static ui_status_icon_scene_t s_scene = UI_STATUS_ICON_BOOT;
-static char s_status_text[UI_STATUS_TEXT_MAX] = "Booting";
-static char s_hint_text[UI_HINT_TEXT_MAX] = "Starting up";
-static char s_idle_hint_text[UI_HINT_TEXT_MAX] = "Hold to Talk";
-static char s_device_name[16] = "BLE";
+static char s_status_text[UI_STATUS_TEXT_MAX] = "おはよう";
+static char s_hint_text[UI_HINT_TEXT_MAX] = "じゅんびちゅう…";
+static char s_idle_hint_text[UI_HINT_TEXT_MAX] = "ボタンでおはなし";
+static char s_storage_text[40] = "";
 static bool s_dimmed;
 /* Set once at boot, before any recording starts. */
 static bool s_recording_on_sd;
@@ -113,17 +125,6 @@ static void lvgl_task(void *arg)
     }
 }
 
-static lv_obj_t *create_blob(lv_obj_t *parent, int32_t w, int32_t h, lv_color_t color)
-{
-    lv_obj_t *obj = lv_obj_create(parent);
-    lv_obj_remove_style_all(obj);
-    lv_obj_set_size(obj, w, h);
-    lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(obj, color, 0);
-    return obj;
-}
-
 static void create_battery_ui(lv_obj_t *screen)
 {
     s_battery_shell = lv_obj_create(screen);
@@ -133,7 +134,7 @@ static void create_battery_ui(lv_obj_t *screen)
     lv_obj_set_style_border_width(s_battery_shell, 1, 0);
     lv_obj_set_style_border_color(s_battery_shell, lv_color_hex(0x675f71), 0);
     lv_obj_set_style_bg_opa(s_battery_shell, LV_OPA_TRANSP, 0);
-    lv_obj_align(s_battery_shell, LV_ALIGN_TOP_RIGHT, -31, 4);
+    lv_obj_align(s_battery_shell, LV_ALIGN_TOP_RIGHT, -27, 4);
 
     s_battery_fill = lv_obj_create(s_battery_shell);
     lv_obj_remove_style_all(s_battery_fill);
@@ -156,7 +157,7 @@ static void create_battery_ui(lv_obj_t *screen)
     lv_obj_set_style_text_color(s_battery_label, lv_color_hex(0x675f71), 0);
     lv_obj_set_style_text_font(s_battery_label, &lv_font_montserrat_10, 0);
     lv_label_set_long_mode(s_battery_label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(s_battery_label, 28);
+    lv_obj_set_width(s_battery_label, 24);
     lv_obj_set_style_text_align(s_battery_label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, 0, 4);
 }
@@ -172,30 +173,25 @@ static void render_scene_locked(ui_status_icon_scene_t scene, const char *status
     lv_label_set_text(s_status_label, status);
     lv_label_set_text(s_hint_label, hint ? hint : "");
     if (scene == UI_STATUS_ICON_ERROR) {
-        lv_obj_set_height(s_hint_label, 42);
+        lv_obj_set_height(s_hint_label, 36);
         lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_DOT);
-        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, UI_HINT_BOTTOM_Y);
     } else {
         lv_obj_set_height(s_hint_label, LV_SIZE_CONTENT);
         lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_WRAP);
-        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, UI_HINT_BOTTOM_Y);
     }
 
     const bool resting = scene == UI_STATUS_ICON_RESTING;
-    const bool pairing = scene == UI_STATUS_ICON_PAIRING || scene == UI_STATUS_ICON_BOOT;
-    const bool error = scene == UI_STATUS_ICON_ERROR;
     lv_color_t bg = resting ? lv_color_hex(0x1b2430) : lv_color_hex(0xfff7ed);
     lv_color_t text = resting ? lv_color_hex(0xe8eef7) : lv_color_hex(0x3f3440);
     lv_color_t muted = resting ? lv_color_hex(0xa8bad2) : lv_color_hex(0x7f7180);
     lv_color_t hint_color = resting ? lv_color_hex(0xdfe9f8) : muted;
-    lv_color_t ble = error ? lv_color_hex(0xf97373) :
-                     pairing ? lv_color_hex(0x8fb8ff) :
-                     lv_color_hex(0x55c98a);
 
     lv_obj_set_style_bg_color(s_screen, bg, 0);
     lv_obj_set_style_text_color(s_screen, text, 0);
-    lv_obj_set_style_text_color(s_top_label, muted, 0);
-    lv_obj_set_style_bg_color(s_ble_dot, ble, 0);
+    lv_obj_set_style_text_color(s_storage_label, muted, 0);
+    lv_obj_set_style_text_color(s_version_label, muted, 0);
     lv_obj_set_style_text_color(s_status_label, text, 0);
     lv_obj_set_style_text_color(s_hint_label, hint_color, 0);
     lv_obj_set_style_text_color(s_battery_label, muted, 0);
@@ -208,7 +204,7 @@ static void render_scene_locked(ui_status_icon_scene_t scene, const char *status
 static void render_current_locked(void)
 {
     if (s_dimmed) {
-        render_scene_locked(UI_STATUS_ICON_RESTING, "Resting", "");
+        render_scene_locked(UI_STATUS_ICON_RESTING, "すやすや…", "");
     } else {
         render_scene_locked(s_scene, s_status_text, s_hint_text);
     }
@@ -221,35 +217,52 @@ static void create_status_ui(void)
     lv_obj_set_style_text_color(s_screen, lv_color_hex(0x3f3440), 0);
     lv_obj_set_style_pad_all(s_screen, 8, 0);
 
-    s_top_label = lv_label_create(s_screen);
-    lv_label_set_text(s_top_label, s_device_name);
-    lv_obj_set_style_text_font(s_top_label, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(s_top_label, lv_color_hex(0x7f7180), 0);
-    lv_label_set_long_mode(s_top_label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(s_top_label, 66);
-    lv_obj_align(s_top_label, LV_ALIGN_TOP_LEFT, 12, 4);
-
-    s_ble_dot = create_blob(s_screen, 8, 8, lv_color_hex(0x8fb8ff));
-    lv_obj_align(s_ble_dot, LV_ALIGN_TOP_LEFT, 0, 6);
+    s_storage_label = lv_label_create(s_screen);
+    lv_label_set_text(s_storage_label, s_storage_text);
+    lv_obj_set_style_text_font(s_storage_label, &ui_font_jp_12, 0);
+    lv_obj_set_style_text_color(s_storage_label, lv_color_hex(0x7f7180), 0);
+    lv_label_set_long_mode(s_storage_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_storage_label, UI_STORAGE_LABEL_W);
+    lv_obj_align(s_storage_label, LV_ALIGN_TOP_LEFT, 0, 1);
 
     create_battery_ui(s_screen);
     ui_status_icons_create(&s_icons, s_screen);
 
     s_status_label = lv_label_create(s_screen);
-    lv_label_set_text(s_status_label, "Booting");
-    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(s_status_label, s_status_text);
+    lv_obj_set_style_text_font(s_status_label, &ui_font_jp_16, 0);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x3f3440), 0);
     lv_obj_set_width(s_status_label, LCD_H_RES - 16);
     lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 168);
+    lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, UI_STATUS_TOP_Y);
 
     s_hint_label = lv_label_create(s_screen);
+    lv_obj_set_style_text_font(s_hint_label, &ui_font_jp_12, 0);
     lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_hint_label, LCD_H_RES - 16);
     lv_obj_set_style_text_align(s_hint_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_hint_label, lv_color_hex(0x7f7180), 0);
-    lv_label_set_text(s_hint_label, "Starting up");
-    lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_label_set_text(s_hint_label, s_hint_text);
+    lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, UI_HINT_BOTTOM_Y);
+
+    /* Firmware version + build date so a fresh flash is visible at a glance
+     * even when version.txt was not bumped. */
+    const esp_app_desc_t *app = esp_app_get_description();
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    int month = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (strncmp(app->date, months[i], 3) == 0) {
+            month = i + 1;
+            break;
+        }
+    }
+    const int day = atoi(app->date + 4);
+    s_version_label = lv_label_create(s_screen);
+    lv_obj_set_style_text_font(s_version_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_version_label, lv_color_hex(0x7f7180), 0);
+    lv_label_set_text_fmt(s_version_label, "v%s (%d/%d)", app->version, month, day);
+    lv_obj_align(s_version_label, LV_ALIGN_BOTTOM_MID, 0, 2);
 
     s_ready = true;
     render_current_locked();
@@ -398,12 +411,24 @@ void ui_status_prepare_deep_sleep(void)
 
 void ui_status_set_device_name(const char *device_name)
 {
-    strlcpy(s_device_name, device_name && device_name[0] ? device_name : "BLE",
-            sizeof(s_device_name));
+    /* The home screen no longer shows the BLE name; keep it in the log only. */
+    ESP_LOGD(TAG, "device name %s", device_name ? device_name : "");
+}
 
+void ui_status_set_storage(bool on_sd, uint64_t free_bytes)
+{
     _lock_acquire(&s_lvgl_lock);
+    if (on_sd) {
+        snprintf(s_storage_text, sizeof(s_storage_text), "あと%.1fGB",
+                 free_bytes / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        /* Internal flash is ~2.5MB; GB would always read 0.0. The MB unit
+         * itself shows the SD card is not in use. */
+        snprintf(s_storage_text, sizeof(s_storage_text), "あと%.1fMB",
+                 free_bytes / (1024.0 * 1024.0));
+    }
     if (s_ready) {
-        lv_label_set_text(s_top_label, s_device_name);
+        lv_label_set_text(s_storage_label, s_storage_text);
     }
     _lock_release(&s_lvgl_lock);
 }
@@ -411,20 +436,20 @@ void ui_status_set_device_name(const char *device_name)
 void ui_status_set_advertising(void)
 {
     ESP_LOGD(TAG, "advertising");
-    set_scene(UI_STATUS_ICON_PAIRING, "Pairing", "Open the Mac app");
+    set_scene(UI_STATUS_ICON_PAIRING, "なかよし中", "Macのアプリをひらいてね");
 }
 
 void ui_status_set_pairing(const char *device_name)
 {
     ESP_LOGD(TAG, "pairing %s", device_name ? device_name : "");
     ui_status_set_device_name(device_name);
-    set_scene(UI_STATUS_ICON_PAIRING, "Pairing", device_name ? device_name : "VS-0000");
+    set_scene(UI_STATUS_ICON_PAIRING, "なかよし中", device_name ? device_name : "VS-0000");
 }
 
 void ui_status_set_idle_hint(const char *hint)
 {
     _lock_acquire(&s_lvgl_lock);
-    strlcpy(s_idle_hint_text, hint && hint[0] ? hint : "Hold to Talk", sizeof(s_idle_hint_text));
+    strlcpy(s_idle_hint_text, hint && hint[0] ? hint : "ボタンでおはなし", sizeof(s_idle_hint_text));
     if (s_scene == UI_STATUS_ICON_IDLE) {
         strlcpy(s_hint_text, s_idle_hint_text, sizeof(s_hint_text));
         render_current_locked();
@@ -435,7 +460,7 @@ void ui_status_set_idle_hint(const char *hint)
 void ui_status_set_idle(void)
 {
     ESP_LOGD(TAG, "idle");
-    set_scene(UI_STATUS_ICON_IDLE, "Ready", s_idle_hint_text);
+    set_scene(UI_STATUS_ICON_IDLE, "まってるよ", s_idle_hint_text);
 }
 
 void ui_status_set_idle_dimmed(bool dimmed)
@@ -461,8 +486,8 @@ void ui_status_set_recording(uint32_t session_id)
 
     _lock_acquire(&s_lvgl_lock);
     s_scene = s_recording_on_sd ? UI_STATUS_ICON_RECORDING_SD : UI_STATUS_ICON_RECORDING;
-    strlcpy(s_status_text, "Listening", sizeof(s_status_text));
-    strlcpy(s_hint_text, "Speak now", sizeof(s_hint_text));
+    strlcpy(s_status_text, "きいてるよ♪", sizeof(s_status_text));
+    strlcpy(s_hint_text, "ボタンでおわるよ", sizeof(s_hint_text));
     render_current_locked();
     _lock_release(&s_lvgl_lock);
 }
@@ -492,30 +517,36 @@ void ui_status_set_battery(int level_percent, bool charging, bool usb_powered)
 void ui_status_set_partial_text(const char *text)
 {
     ESP_LOGD(TAG, "partial: %s", text ? text : "");
-    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Thinking", text ? text : "");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "かんがえ中", text ? text : "");
 }
 
 void ui_status_set_capacity(const char *text)
 {
     ESP_LOGD(TAG, "capacity: %s", text ? text : "");
-    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Storage", text ? text : "");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "おなかのぐあい", text ? text : "");
 }
 
 void ui_status_set_syncing(const char *hint)
 {
     ESP_LOGD(TAG, "sync: %s", hint ? hint : "");
-    set_scene(UI_STATUS_ICON_PAIRING, "Sync", hint ? hint : "");
+    set_scene(UI_STATUS_ICON_PAIRING, "おでかけ中", hint ? hint : "");
+}
+
+void ui_status_set_sync_problem(const char *status, const char *hint)
+{
+    ESP_LOGD(TAG, "sync problem: %s", hint ? hint : "");
+    set_scene(UI_STATUS_ICON_PAIRING, status ? status : "", hint ? hint : "");
 }
 
 void ui_status_set_wifi_connected(const char *hint)
 {
-    set_scene(UI_STATUS_ICON_WIFI, "Wi-Fi", hint ? hint : "");
+    set_scene(UI_STATUS_ICON_WIFI, "とどけてるよ", hint ? hint : "");
 }
 
 void ui_status_set_sync_success(const char *hint)
 {
     ESP_LOGD(TAG, "sync success: %s", hint ? hint : "");
-    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Success", hint ? hint : "");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "とどけたよ！", hint ? hint : "");
 }
 
 void ui_status_set_ota_progress(uint32_t written, uint32_t size)
@@ -526,16 +557,16 @@ void ui_status_set_ota_progress(uint32_t written, uint32_t size)
         percent = MIN(100, (written * 100) / size);
     }
     snprintf(hint, sizeof(hint), "%" PRIu32 "%%", percent);
-    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Updating", hint);
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "おきがえ中", hint);
 }
 
 void ui_status_set_ota_rebooting(void)
 {
-    set_scene(UI_STATUS_ICON_TRANSCRIBING, "Rebooting", "Firmware updated");
+    set_scene(UI_STATUS_ICON_TRANSCRIBING, "できた！", "おきがえしたよ");
 }
 
 void ui_status_set_error(const char *message)
 {
     ESP_LOGE(TAG, "%s", message ? message : "unknown error");
-    set_scene(UI_STATUS_ICON_ERROR, "", message ? message : "Unknown error");
+    set_scene(UI_STATUS_ICON_ERROR, "こまったよ…", message ? message : "よくわからないエラーだよ");
 }

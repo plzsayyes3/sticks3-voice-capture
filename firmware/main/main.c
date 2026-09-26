@@ -134,6 +134,7 @@ static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, ui
 static void queue_ui_state_event(const char *state, const char *text);
 static void apply_interaction_mode(interaction_mode_t mode);
 static void show_storage_capacity(void);
+static void refresh_storage_label(void);
 static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsigned failed);
 
 static bool is_external_powered(void)
@@ -376,7 +377,7 @@ static uint32_t start_recording(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "acquire recording pm locks failed: %s", esp_err_to_name(err));
         s_app_ui_state = APP_UI_STATE_ERROR;
-        ui_status_set_error("Power lock failed");
+        ui_status_set_error("でんきのじゅんびができないよ");
         return 0;
     }
 
@@ -385,7 +386,7 @@ static uint32_t start_recording(void)
         ESP_LOGE(TAG, "audio start failed: %s", esp_err_to_name(err));
         release_recording_pm_locks();
         s_app_ui_state = APP_UI_STATE_ERROR;
-        ui_status_set_error("Audio start failed");
+        ui_status_set_error("マイクがうごかないよ");
         return 0;
     }
 
@@ -410,10 +411,11 @@ static uint32_t stop_recording(void)
     restart_display_dim_timer();
     restart_deep_sleep_timer();
 
+    refresh_storage_label();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "audio stop failed: %s", esp_err_to_name(err));
         s_app_ui_state = APP_UI_STATE_ERROR;
-        ui_status_set_error("Recording failed");
+        ui_status_set_error("ろくおんできなかったよ");
     } else if (!voice_ble_is_ready()) {
         s_app_ui_state = APP_UI_STATE_READY;
         ui_status_set_idle();
@@ -625,10 +627,10 @@ static void apply_app_ui_state(const char *state, const char *text)
         ui_status_set_partial_text("");
     } else if (strcmp(state, "pending_confirmation") == 0) {
         s_app_ui_state = APP_UI_STATE_PENDING_CONFIRMATION;
-        ui_status_set_partial_text("Confirm or cancel");
+        ui_status_set_partial_text("けっていかキャンセルしてね");
     } else if (strcmp(state, "error") == 0) {
         s_app_ui_state = APP_UI_STATE_ERROR;
-        ui_status_set_error(text && text[0] ? text : "Unknown error");
+        ui_status_set_error(text && text[0] ? text : "よくわからないエラーだよ");
     } else {
         ESP_LOGW(TAG, "unknown ui_state %s", state);
     }
@@ -640,7 +642,8 @@ static void apply_app_ui_state(const char *state, const char *text)
 static void apply_interaction_mode(interaction_mode_t mode)
 {
     s_interaction_mode = mode;
-    ui_status_set_idle_hint(mode == INTERACTION_MODE_CLICK_TO_TALK ? "Click to Talk" : "Hold to Talk");
+    ui_status_set_idle_hint(mode == INTERACTION_MODE_CLICK_TO_TALK ? "ボタンでおはなし"
+                                                                   : "おしたままはなそう");
     if (s_app_ui_state == APP_UI_STATE_READY && !s_recording) {
         ui_status_set_idle();
     }
@@ -750,15 +753,15 @@ static void app_event_task(void *arg)
                 show_storage_capacity();
             } else if (s_recording) {
                 ESP_LOGW(TAG, "Sync skipped: recording in progress");
-                ui_status_set_idle_hint("Sync: recording");
+                ui_status_set_idle_hint("ろくおん中はおくれないよ");
             } else if (wifi_sync_is_running()) {
                 ESP_LOGI(TAG, "Sync already in progress");
             } else {
-                ui_status_set_syncing("Wi-Fi Sync...");
+                ui_status_set_syncing("Wi-Fiをさがしてるよ");
                 esp_err_t sync_err = wifi_sync_start();
                 if (sync_err != ESP_OK) {
                     ESP_LOGW(TAG, "Sync start failed: %s", esp_err_to_name(sync_err));
-                    ui_status_set_idle_hint("Sync unavailable");
+                    ui_status_set_idle_hint("いまはおくれないよ");
                 }
             }
             break;
@@ -767,7 +770,7 @@ static void app_event_task(void *arg)
             show_sync_result((wifi_sync_result_t)event.error, event.written, event.size);
             break;
         case APP_EVENT_WIFI_CONNECTED:
-            ui_status_set_wifi_connected("Uploading...");
+            ui_status_set_wifi_connected("Macにおくってるよ");
             break;
         case APP_EVENT_UI_STATE:
             apply_app_ui_state(event.state, event.text);
@@ -807,7 +810,7 @@ static void app_event_task(void *arg)
             restart_display_dim_timer();
             restart_deep_sleep_timer();
             s_app_ui_state = APP_UI_STATE_ERROR;
-            ui_status_set_error("Recording failed");
+            ui_status_set_error("ろくおんできなかったよ");
             break;
         case APP_EVENT_POWER_IRQ:
             gpio_intr_enable(STICK_S3_PIN_PMIC_IRQ);
@@ -973,32 +976,37 @@ static esp_err_t init_sync_result_display_timer(void)
 
 static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsigned failed)
 {
-    char hint[32];
+    char hint[64];
+    const char *status = "";
     switch (result) {
     case WIFI_SYNC_RESULT_OK:
         if (uploaded > 0) {
-            snprintf(hint, sizeof(hint), "Success (%u)", uploaded);
+            snprintf(hint, sizeof(hint), "%uこおくったよ", uploaded);
         } else {
-            strlcpy(hint, "Success", sizeof(hint));
+            strlcpy(hint, "ぜんぶとどいてるよ", sizeof(hint));
         }
         break;
     case WIFI_SYNC_RESULT_PARTIAL_FAIL:
-        snprintf(hint, sizeof(hint), "%u failed", failed);
+        status = "おしい！";
+        snprintf(hint, sizeof(hint), "%uこはあとでね", failed);
         break;
     case WIFI_SYNC_RESULT_NO_NETWORK:
-        strlcpy(hint, "No network", sizeof(hint));
+        status = "みつからないよ";
+        strlcpy(hint, "またあとでね", sizeof(hint));
         break;
     case WIFI_SYNC_RESULT_ERROR:
     default:
-        strlcpy(hint, "Sync error", sizeof(hint));
+        status = "こまったよ…";
+        strlcpy(hint, "Wi-Fiがうごかないよ", sizeof(hint));
         break;
     }
-    ESP_LOGI(TAG, "wifi sync result: %s (uploaded=%u failed=%u)", hint, uploaded, failed);
+    ESP_LOGI(TAG, "wifi sync result=%d (uploaded=%u failed=%u)", (int)result, uploaded, failed);
     if (result == WIFI_SYNC_RESULT_OK) {
         ui_status_set_sync_success(hint);
     } else {
-        ui_status_set_syncing(hint);
+        ui_status_set_sync_problem(status, hint);
     }
+    refresh_storage_label();
 
     if (s_sync_result_display_timer) {
         (void)esp_timer_stop(s_sync_result_display_timer);
@@ -1009,6 +1017,18 @@ static void show_sync_result(wifi_sync_result_t result, unsigned uploaded, unsig
     }
 }
 
+/* Top-row "remaining space" readout; refreshed after anything that changes it. */
+static void refresh_storage_label(void)
+{
+    uint64_t used_bytes = 0;
+    uint64_t capacity_bytes = 0;
+    if (recording_store_get_usage(&used_bytes, &capacity_bytes) != ESP_OK) {
+        return;
+    }
+    ui_status_set_storage(recording_store_on_sd(),
+                          capacity_bytes > used_bytes ? capacity_bytes - used_bytes : 0);
+}
+
 static void show_storage_capacity(void)
 {
     uint64_t used_bytes = 0;
@@ -1016,13 +1036,22 @@ static void show_storage_capacity(void)
     esp_err_t err = recording_store_get_usage(&used_bytes, &capacity_bytes);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "capacity query failed: %s", esp_err_to_name(err));
-        ui_status_set_capacity("Unavailable");
+        ui_status_set_capacity("わからないよ");
         return;
     }
 
-    char text[32];
-    snprintf(text, sizeof(text), "%.1f / %.1f MB",
-             used_bytes / (1024.0 * 1024.0), capacity_bytes / (1024.0 * 1024.0));
+    char text[64];
+    const uint64_t free_bytes = capacity_bytes > used_bytes ? capacity_bytes - used_bytes : 0;
+    if (recording_store_on_sd()) {
+        const double gb = 1024.0 * 1024.0 * 1024.0;
+        snprintf(text, sizeof(text), "SDあと%.1f/%.1fGB",
+                 free_bytes / gb, capacity_bytes / gb);
+    } else {
+        const double mb = 1024.0 * 1024.0;
+        snprintf(text, sizeof(text), "あと%.1f/%.1fMB",
+                 free_bytes / mb, capacity_bytes / mb);
+    }
+    ui_status_set_storage(recording_store_on_sd(), free_bytes);
     ESP_LOGI(TAG, "storage capacity: %s", text);
     ui_status_set_capacity(text);
 
@@ -1215,10 +1244,11 @@ void app_main(void)
     if (audio_err != ESP_OK) {
         ESP_LOGE(TAG, "audio init failed: %s", esp_err_to_name(audio_err));
         s_app_ui_state = APP_UI_STATE_ERROR;
-        ui_status_set_error("Audio init failed");
+        ui_status_set_error("マイクのじゅんびができないよ");
     } else {
         audio_pipeline_set_error_callback(audio_pipeline_error_cb);
         ui_status_set_recording_on_sd(recording_store_on_sd());
+        refresh_storage_label();
         apply_interaction_mode(INTERACTION_MODE_CLICK_TO_TALK);
         /* This app is local-only now (no BLE companion app), so BLE never
          * connects in normal use — showing "Pairing" here would mean the
