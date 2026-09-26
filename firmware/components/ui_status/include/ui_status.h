@@ -20,6 +20,10 @@ void ui_status_set_battery(int level_percent, bool charging, bool usb_powered);
 void ui_status_set_partial_text(const char *text);
 void ui_status_set_capacity(const char *text);
 void ui_status_set_syncing(const char *hint);
+/* Sync finished without success: no network, partial failure, driver error. */
+void ui_status_set_sync_problem(const char *status, const char *hint);
+/* Remaining space where recordings go (top row). GB on SD, MB on flash. */
+void ui_status_set_storage(bool on_sd, uint64_t free_bytes);
 /* Wi-Fi joined during a sync; uploads are running (sky-blue Rady). */
 void ui_status_set_wifi_connected(const char *hint);
 void ui_status_set_sync_success(const char *hint);
