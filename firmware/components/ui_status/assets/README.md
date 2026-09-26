@@ -16,5 +16,6 @@ Current device mapping:
 - Recording to internal flash: green Rady with music notes.
 - Recording to the SD card: pink Rady with music notes (chosen at boot from
   `recording_store_on_sd()`).
-- Sky-blue Wi-Fi-connected is not mapped: `ui_status_set_syncing()` is shown
-  both before connecting and for failed syncs, so it is not a connected state.
+- Wi-Fi joined during a sync (uploads running): sky-blue Rady with sparkles.
+  `wifi_sync` reports the joined network explicitly; scanning and failed syncs
+  keep the orange "Sync" screen.

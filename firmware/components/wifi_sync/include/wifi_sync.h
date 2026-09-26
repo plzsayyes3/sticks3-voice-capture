@@ -34,3 +34,9 @@ typedef void (*wifi_sync_done_cb_t)(wifi_sync_result_t result, unsigned uploaded
  * caller's, so the callback must only do things safe to call from another
  * task (e.g. queue an event), not touch caller-local state directly. */
 void wifi_sync_set_done_callback(wifi_sync_done_cb_t callback);
+
+typedef void (*wifi_sync_connected_cb_t)(void);
+/* Called from the wifi_sync task once a known network is joined, before
+ * uploads start. Never called when no network is reached. Same threading
+ * rule as the done callback: only queue an event. */
+void wifi_sync_set_connected_callback(wifi_sync_connected_cb_t callback);

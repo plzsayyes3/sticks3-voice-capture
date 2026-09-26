@@ -9,6 +9,7 @@ ICON_NAMES = (
     "rady_ready",
     "rady_listening",
     "rady_listening_sd",
+    "rady_wifi",
     "rady_thinking",
     "rady_resting",
     "rady_error",
@@ -61,6 +62,14 @@ class RadyAssetTests(unittest.TestCase):
         # Pink keeps blue level with green; orange drops blue ~27 below green.
         self.assertLess(abs(blue - green), 10)
 
+    def test_wifi_icon_uses_the_sky_blue_row(self):
+        data = (ASSET_DIR / "rady_wifi_argb8888.bin").read_bytes()
+        red = average_visible_channel(data, 2)
+        green = average_visible_channel(data, 1)
+        blue = average_visible_channel(data, 0)
+        self.assertGreater(blue, red)
+        self.assertGreater(green, red)
+
     def test_ready_and_recording_scenes_reference_rady_assets(self):
         source = (ASSET_DIR.parent / "ui_status_icons.c").read_text()
         self.assertIn("_binary_rady_ready_argb8888_bin_start", source)
@@ -69,6 +78,8 @@ class RadyAssetTests(unittest.TestCase):
         self.assertIn("case UI_STATUS_ICON_RECORDING:\n        return &s_rady_listening;", source)
         self.assertIn("_binary_rady_listening_sd_argb8888_bin_start", source)
         self.assertIn("case UI_STATUS_ICON_RECORDING_SD:\n        return &s_rady_listening_sd;", source)
+        self.assertIn("_binary_rady_wifi_argb8888_bin_start", source)
+        self.assertIn("case UI_STATUS_ICON_WIFI:\n        return &s_rady_wifi;", source)
 
 
 if __name__ == "__main__":

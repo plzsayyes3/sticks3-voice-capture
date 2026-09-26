@@ -20,6 +20,8 @@ void ui_status_set_battery(int level_percent, bool charging, bool usb_powered);
 void ui_status_set_partial_text(const char *text);
 void ui_status_set_capacity(const char *text);
 void ui_status_set_syncing(const char *hint);
+/* Wi-Fi joined during a sync; uploads are running (sky-blue Rady). */
+void ui_status_set_wifi_connected(const char *hint);
 void ui_status_set_sync_success(const char *hint);
 void ui_status_set_ota_progress(uint32_t written, uint32_t size);
 void ui_status_set_ota_rebooting(void);

@@ -45,6 +45,12 @@ static bool s_initialized;
 static atomic_bool s_sync_running;
 static EventGroupHandle_t s_wifi_event_group;
 static wifi_sync_done_cb_t s_done_cb;
+static wifi_sync_connected_cb_t s_connected_cb;
+
+void wifi_sync_set_connected_callback(wifi_sync_connected_cb_t callback)
+{
+    s_connected_cb = callback;
+}
 
 void wifi_sync_set_done_callback(wifi_sync_done_cb_t callback)
 {
@@ -465,6 +471,9 @@ static void wifi_sync_task(void *arg)
     }
 
     if (connect_to_known_network()) {
+        if (s_connected_cb) {
+            s_connected_cb();
+        }
         unsigned uploaded = 0;
         unsigned failed = 0;
         sync_pending_recordings(&uploaded, &failed);

@@ -17,13 +17,14 @@ SOURCE = ASSET_DIR / "rady_sprite_sheet_source.png"
 ICON_SIZE = 112
 
 # Pixel bounds in the 1774x887 source sheet. The chosen color rows are orange
-# for standby/supporting scenes, green for recording to internal storage and
-# pink for recording to the SD card.
+# for standby/supporting scenes, green for recording to internal storage,
+# pink for recording to the SD card and sky blue while Wi-Fi is connected.
 POSES = {
     "rady_pairing": (158, 705, 337, 886),  # orange, sparkle
     "rady_ready": (514, 705, 682, 886),  # orange, neutral
     "rady_listening": (696, 188, 910, 372),  # green, music notes
     "rady_listening_sd": (696, 0, 910, 187),  # pink, music notes
+    "rady_wifi": (158, 355, 337, 535),  # sky blue, sparkle
     "rady_thinking": (1524, 705, 1713, 886),  # orange, thought bubble
     "rady_resting": (1110, 705, 1345, 886),  # orange, sleeping
     "rady_error": (1346, 705, 1526, 886),  # orange, puzzled

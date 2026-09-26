@@ -11,6 +11,7 @@ extern const uint8_t rady_pairing_start[] asm("_binary_rady_pairing_argb8888_bin
 extern const uint8_t rady_ready_start[] asm("_binary_rady_ready_argb8888_bin_start");
 extern const uint8_t rady_listening_start[] asm("_binary_rady_listening_argb8888_bin_start");
 extern const uint8_t rady_listening_sd_start[] asm("_binary_rady_listening_sd_argb8888_bin_start");
+extern const uint8_t rady_wifi_start[] asm("_binary_rady_wifi_argb8888_bin_start");
 extern const uint8_t rady_thinking_start[] asm("_binary_rady_thinking_argb8888_bin_start");
 extern const uint8_t rady_resting_start[] asm("_binary_rady_resting_argb8888_bin_start");
 extern const uint8_t rady_error_start[] asm("_binary_rady_error_argb8888_bin_start");
@@ -59,6 +60,17 @@ static const lv_image_dsc_t s_rady_listening_sd = {
     .data = rady_listening_sd_start,
 };
 
+static const lv_image_dsc_t s_rady_wifi = {
+    .header.magic = LV_IMAGE_HEADER_MAGIC,
+    .header.cf = LV_COLOR_FORMAT_ARGB8888,
+    .header.flags = 0,
+    .header.w = RADY_ICON_SIZE,
+    .header.h = RADY_ICON_SIZE,
+    .header.stride = RADY_ICON_STRIDE,
+    .data_size = RADY_ICON_DATA_SIZE,
+    .data = rady_wifi_start,
+};
+
 static const lv_image_dsc_t s_rady_thinking = {
     .header.magic = LV_IMAGE_HEADER_MAGIC,
     .header.cf = LV_COLOR_FORMAT_ARGB8888,
@@ -95,8 +107,8 @@ static const lv_image_dsc_t s_rady_error = {
 static const lv_image_dsc_t *get_scene_image(ui_status_icon_scene_t scene)
 {
     /* Recording is green for internal flash and pink for the SD card; the
-     * caller picks the scene from recording_store_on_sd(). Keep future Wi-Fi
-     * colors tied to explicit application states instead of inferring them. */
+     * caller picks the scene from recording_store_on_sd(). Sky blue is only
+     * shown once wifi_sync reports a joined network, never while scanning. */
     switch (scene) {
     case UI_STATUS_ICON_BOOT:
     case UI_STATUS_ICON_PAIRING:
@@ -109,6 +121,8 @@ static const lv_image_dsc_t *get_scene_image(ui_status_icon_scene_t scene)
         return &s_rady_listening;
     case UI_STATUS_ICON_RECORDING_SD:
         return &s_rady_listening_sd;
+    case UI_STATUS_ICON_WIFI:
+        return &s_rady_wifi;
     case UI_STATUS_ICON_TRANSCRIBING:
         return &s_rady_thinking;
     case UI_STATUS_ICON_ERROR:
