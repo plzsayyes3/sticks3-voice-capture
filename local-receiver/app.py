@@ -303,6 +303,13 @@ def build_whisper_command(wav_path: Path, out_prefix: Path) -> list[str]:
     return whisper_cmd
 
 
+class NoSpeechError(RuntimeError):
+    """whisper-cli ran fine but found no speech (silent or sub-second clip).
+
+    Retrying cannot change the outcome, so the recording is completed without
+    a note instead of being retried on every restart."""
+
+
 def transcribe_ogg(ogg_path: Path) -> str:
     with tempfile.TemporaryDirectory() as temp_dir:
         wav_path = Path(temp_dir) / "audio.wav"
@@ -328,7 +335,7 @@ def transcribe_ogg(ogg_path: Path) -> str:
         text_path = out_prefix.with_suffix(".txt")
         transcript = text_path.read_text(encoding="utf-8").strip()
         if not transcript:
-            raise RuntimeError("whisper-cli produced an empty transcript")
+            raise NoSpeechError("whisper-cli produced an empty transcript")
         return transcript
 
 
@@ -406,7 +413,23 @@ def process_recording_async(recording_id: str) -> None:
         if transcript_path.exists():
             transcript = transcript_path.read_text(encoding="utf-8")
         else:
-            transcript = transcribe_ogg(ogg_path)
+            try:
+                transcript = transcribe_ogg(ogg_path)
+            except NoSpeechError:
+                app.logger.info("no speech in %s; completing without a note", recording_id)
+                atomic_write_text(
+                    DONE_DIR / f"{recording_id}.json",
+                    json.dumps(
+                        {
+                            "recording_id": recording_id,
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                            "mynotebook_path": None,
+                            "mynotebook_status": "no_speech",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                return
             atomic_write_text(transcript_path, transcript)
 
         markdown_path = NOTES_DIR / f"{recording_id}.md"

@@ -7,16 +7,33 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+
+#include "driver/sdspi_host.h"
+#include "driver/spi_common.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 #include "wear_levelling.h"
 
 static const char *TAG = "recording_store";
 
 #define STORAGE_LABEL "storage"
-#define STORAGE_BASE_PATH "/recordings"
+#define FLASH_BASE_PATH "/recordings"
+
+/* M5Stack TF HAT (SKU 9551) on the StickS3 HAT header. The HAT ties the
+ * card's CS line itself, so the slot runs without a CS GPIO. SPI2 already
+ * belongs to the LCD, hence SPI3. The HAT is powered from the 3.3V rail;
+ * the PM1 5V boost is not required. */
+#define SD_SPI_HOST SPI3_HOST
+#define SD_PIN_SCK 8
+#define SD_PIN_MISO 1
+#define SD_PIN_MOSI 0
+#define SD_FREQ_KHZ SDMMC_FREQ_DEFAULT
+#define SD_MOUNT_POINT "/sdcard"
+#define SD_BASE_PATH SD_MOUNT_POINT "/REC"
 #define STORAGE_MAX_FILES 6
 #define STORAGE_ALLOCATION_UNIT 4096
 #define OGG_MAX_SEGMENTS 255
@@ -44,7 +61,11 @@ typedef struct {
 } recording_writer_t;
 
 static bool s_mounted;
+static bool s_on_sd;
+static const char *s_mount_point = FLASH_BASE_PATH;
+static const char *s_base_path = FLASH_BASE_PATH;
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+static sdmmc_card_t *s_sd_card;
 static recording_writer_t s_writer;
 
 static void put_le16(uint8_t *dst, uint16_t value)
@@ -253,7 +274,7 @@ static bool storage_partition_is_blank(void)
 
 static void log_recoverable_partials(void)
 {
-    DIR *dir = opendir(STORAGE_BASE_PATH);
+    DIR *dir = opendir(s_base_path);
     if (!dir) {
         return;
     }
@@ -264,7 +285,7 @@ static void log_recoverable_partials(void)
         const char *name = entry->d_name;
         size_t len = strlen(name);
         if (len >= 5 && strcmp(name + len - 5, ".part") == 0) {
-            ESP_LOGW(TAG, "recoverable partial recording: %s/%s", STORAGE_BASE_PATH, name);
+            ESP_LOGW(TAG, "recoverable partial recording: %s/%s", s_base_path, name);
             partials++;
         }
     }
@@ -277,7 +298,12 @@ static void log_recoverable_partials(void)
 
 const char *recording_store_base_path(void)
 {
-    return STORAGE_BASE_PATH;
+    return s_base_path;
+}
+
+bool recording_store_on_sd(void)
+{
+    return s_on_sd;
 }
 
 esp_err_t recording_store_get_usage(uint64_t *used_bytes, uint64_t *capacity_bytes)
@@ -288,7 +314,7 @@ esp_err_t recording_store_get_usage(uint64_t *used_bytes, uint64_t *capacity_byt
 
     uint64_t total = 0;
     uint64_t free_space = 0;
-    esp_err_t err = esp_vfs_fat_info(STORAGE_BASE_PATH, &total, &free_space);
+    esp_err_t err = esp_vfs_fat_info(s_mount_point, &total, &free_space);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(err));
         return err;
@@ -303,15 +329,65 @@ esp_err_t recording_store_get_usage(uint64_t *used_bytes, uint64_t *capacity_byt
     return ESP_OK;
 }
 
-esp_err_t recording_store_init(void)
+static esp_err_t mount_sd(void)
 {
-    if (s_mounted) {
-        return ESP_OK;
+    const spi_bus_config_t bus_config = {
+        .mosi_io_num = SD_PIN_MOSI,
+        .miso_io_num = SD_PIN_MISO,
+        .sclk_io_num = SD_PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    esp_err_t err = spi_bus_initialize(SD_SPI_HOST, &bus_config, SDSPI_DEFAULT_DMA);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SD SPI bus init failed: %s", esp_err_to_name(err));
+        return err;
     }
 
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SD_SPI_HOST;
+    host.max_freq_khz = SD_FREQ_KHZ;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.host_id = SD_SPI_HOST;
+    slot_config.gpio_cs = SDSPI_SLOT_NO_CS;
+
+    /* Never format the card: it may hold the user's own files, and a
+     * missing/unreadable card simply falls back to internal flash. */
+    const esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = STORAGE_MAX_FILES,
+        .allocation_unit_size = 0,
+    };
+
+    err = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_sd_card);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SD card not mounted: %s", esp_err_to_name(err));
+        spi_bus_free(SD_SPI_HOST);
+        s_sd_card = NULL;
+        return err;
+    }
+
+    if (mkdir(SD_BASE_PATH, 0777) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "create %s failed errno=%d", SD_BASE_PATH, errno);
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sd_card);
+        spi_bus_free(SD_SPI_HOST);
+        s_sd_card = NULL;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "SD card %s, %" PRIu64 " MB",
+             s_sd_card->cid.name,
+             ((uint64_t)s_sd_card->csd.capacity * s_sd_card->csd.sector_size) >> 20);
+    return ESP_OK;
+}
+
+static esp_err_t mount_flash(bool allow_format)
+{
     const bool blank_partition = storage_partition_is_blank();
     esp_vfs_fat_mount_config_t config = {
-        .format_if_mount_failed = blank_partition,
+        .format_if_mount_failed = allow_format && blank_partition,
         .max_files = STORAGE_MAX_FILES,
         .allocation_unit_size = STORAGE_ALLOCATION_UNIT,
     };
@@ -321,18 +397,71 @@ esp_err_t recording_store_init(void)
     }
 
     esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
-        STORAGE_BASE_PATH, STORAGE_LABEL, &config, &s_wl_handle);
+        FLASH_BASE_PATH, STORAGE_LABEL, &config, &s_wl_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
                  "mount storage failed without destructive retry: %s",
                  esp_err_to_name(err));
-        return err;
+    }
+    return err;
+}
+
+esp_err_t recording_store_init(void)
+{
+    if (s_mounted) {
+        return ESP_OK;
+    }
+
+    if (mount_sd() == ESP_OK) {
+        s_on_sd = true;
+        s_mount_point = SD_MOUNT_POINT;
+        s_base_path = SD_BASE_PATH;
+    } else {
+        esp_err_t err = mount_flash(true);
+        if (err != ESP_OK) {
+            return err;
+        }
+        s_on_sd = false;
+        s_mount_point = FLASH_BASE_PATH;
+        s_base_path = FLASH_BASE_PATH;
     }
 
     s_mounted = true;
     log_recoverable_partials();
-    ESP_LOGI(TAG, "recording storage mounted at %s", STORAGE_BASE_PATH);
+    ESP_LOGI(TAG, "recording storage mounted at %s (%s)",
+             s_base_path, s_on_sd ? "SD card" : "internal flash");
     return ESP_OK;
+}
+
+const char *recording_store_open_flash_backlog(void)
+{
+    /* Only meaningful while recordings go to the SD card: internal flash may
+     * still hold recordings made before the card was fitted. Never formats;
+     * a blank partition simply has nothing to sync. */
+    if (!s_mounted || !s_on_sd || s_wl_handle != WL_INVALID_HANDLE) {
+        return NULL;
+    }
+    if (storage_partition_is_blank()) {
+        return NULL;
+    }
+    if (mount_flash(false) != ESP_OK) {
+        s_wl_handle = WL_INVALID_HANDLE;
+        return NULL;
+    }
+    ESP_LOGI(TAG, "internal flash backlog mounted at %s", FLASH_BASE_PATH);
+    return FLASH_BASE_PATH;
+}
+
+void recording_store_close_flash_backlog(void)
+{
+    if (!s_on_sd || s_wl_handle == WL_INVALID_HANDLE) {
+        return;
+    }
+    esp_err_t err = esp_vfs_fat_spiflash_unmount_rw_wl(FLASH_BASE_PATH, s_wl_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "unmount flash backlog failed: %s", esp_err_to_name(err));
+    }
+    s_wl_handle = WL_INVALID_HANDLE;
 }
 
 esp_err_t recording_store_begin(uint32_t session_id,
@@ -355,11 +484,11 @@ esp_err_t recording_store_begin(uint32_t session_id,
     for (int attempt = 0; attempt < 8; ++attempt) {
         uint32_t suffix = esp_random();
         int temp_len = snprintf(s_writer.temp_path, sizeof(s_writer.temp_path),
-                                STORAGE_BASE_PATH "/%08" PRIu32 "-%08" PRIx32 ".part",
-                                session_id, suffix);
+                                "%s/%08" PRIu32 "-%08" PRIx32 ".part",
+                                s_base_path, session_id, suffix);
         int final_len = snprintf(s_writer.final_path, sizeof(s_writer.final_path),
-                                 STORAGE_BASE_PATH "/%08" PRIu32 "-%08" PRIx32 ".ogg",
-                                 session_id, suffix);
+                                 "%s/%08" PRIu32 "-%08" PRIx32 ".ogg",
+                                 s_base_path, session_id, suffix);
         if (temp_len <= 0 || final_len <= 0 ||
             temp_len >= (int)sizeof(s_writer.temp_path) ||
             final_len >= (int)sizeof(s_writer.final_path)) {

@@ -35,7 +35,8 @@ static const char *TAG = "wifi_sync";
  * pass (see collect_sync_candidates) instead of mutating entries while
  * readdir() is still iterating the directory, which is unsafe on FATFS
  * (entries can be skipped or re-visited). 48 is far above what the
- * ~3.94MB storage partition holds at typical recording sizes. */
+ * ~2.56MB internal partition holds; on the SD card more can pile up, and
+ * anything past 48 simply syncs on the next run. */
 #define MAX_SYNC_CANDIDATES 48
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -45,6 +46,12 @@ static bool s_initialized;
 static atomic_bool s_sync_running;
 static EventGroupHandle_t s_wifi_event_group;
 static wifi_sync_done_cb_t s_done_cb;
+static wifi_sync_connected_cb_t s_connected_cb;
+
+void wifi_sync_set_connected_callback(wifi_sync_connected_cb_t callback)
+{
+    s_connected_cb = callback;
+}
 
 void wifi_sync_set_done_callback(wifi_sync_done_cb_t callback)
 {
@@ -176,7 +183,7 @@ static bool is_pending_recording(const char *name)
 
 /* Recordings synced by firmware before this change were left behind as
  * "<id>.ogg.sent" (renamed, never deleted) and would otherwise sit on the
- * ~3.94MB storage partition forever. These are already confirmed uploaded
+ * ~2.56MB storage partition forever. These are already confirmed uploaded
  * by definition of having been renamed, so sync can just clear them out. */
 static bool is_stale_sent_file(const char *name)
 {
@@ -338,9 +345,23 @@ static void collect_sync_candidates(const char *base_path, sync_candidates_t *ou
     closedir(dir);
 }
 
+static void clear_stale_sent(const char *base_path, const sync_candidates_t *candidates)
+{
+    for (size_t i = 0; i < candidates->stale_sent_count; ++i) {
+        char full_path[PATH_BUFFER_SIZE];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->stale_sent[i]);
+        if (remove(full_path) != 0) {
+            ESP_LOGW(TAG, "failed to clear stale synced file %s", candidates->stale_sent[i]);
+        } else {
+            ESP_LOGI(TAG, "cleared stale synced file %s", candidates->stale_sent[i]);
+        }
+    }
+}
+
 static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed)
 {
     const char *base_path = recording_store_base_path();
+    bool flash_backlog = false;
 
     /* Heap-allocated and freed within this call rather than static/global:
      * a static sync_candidates_t here would permanently reserve ~3.8KB of
@@ -357,14 +378,22 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
         return;
     }
     collect_sync_candidates(base_path, candidates);
+    clear_stale_sent(base_path, candidates);
+    size_t stale_cleared = candidates->stale_sent_count;
 
-    for (size_t i = 0; i < candidates->stale_sent_count; ++i) {
-        char full_path[PATH_BUFFER_SIZE];
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, candidates->stale_sent[i]);
-        if (remove(full_path) != 0) {
-            ESP_LOGW(TAG, "failed to clear stale synced file %s", candidates->stale_sent[i]);
-        } else {
-            ESP_LOGI(TAG, "cleared stale synced file %s", candidates->stale_sent[i]);
+    /* Nothing pending on the SD card: look once at internal flash for
+     * recordings made before the card was fitted. Only mounted for this
+     * sync and released again below. */
+    if (candidates->pending_count == 0 && recording_store_on_sd()) {
+        const char *flash_path = recording_store_open_flash_backlog();
+        if (flash_path) {
+            flash_backlog = true;
+            base_path = flash_path;
+            collect_sync_candidates(base_path, candidates);
+            clear_stale_sent(base_path, candidates);
+            stale_cleared += candidates->stale_sent_count;
+            ESP_LOGI(TAG, "SD has nothing pending; %u pending in internal flash",
+                     (unsigned)candidates->pending_count);
         }
     }
 
@@ -392,7 +421,7 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
             /* The receiver fsyncs the recording durably and dedupes by
              * SHA-256 before replying 200/201, so a success response means
              * the recording is safe on the Mac. Delete rather than rename
-             * to .sent: the storage partition is only ~3.94MB, and files
+             * to .sent: the storage partition is only ~2.56MB, and files
              * that are merely renamed never free that space. */
             if (remove(full_path) != 0) {
                 ESP_LOGW(TAG, "uploaded %s but delete failed; will retry next sync",
@@ -405,9 +434,12 @@ static void sync_pending_recordings(unsigned *out_uploaded, unsigned *out_failed
         }
     }
 
-    ESP_LOGI(TAG, "sync complete: %u uploaded, %u failed, %u stale .sent cleared",
-             uploaded, failed, (unsigned)candidates->stale_sent_count);
+    ESP_LOGI(TAG, "sync complete (%s): %u uploaded, %u failed, %u stale .sent cleared",
+             base_path, uploaded, failed, (unsigned)stale_cleared);
     free(candidates);
+    if (flash_backlog) {
+        recording_store_close_flash_backlog();
+    }
     *out_uploaded = uploaded;
     *out_failed = failed;
 }
@@ -440,6 +472,9 @@ static void wifi_sync_task(void *arg)
     }
 
     if (connect_to_known_network()) {
+        if (s_connected_cb) {
+            s_connected_cb();
+        }
         unsigned uploaded = 0;
         unsigned failed = 0;
         sync_pending_recordings(&uploaded, &failed);

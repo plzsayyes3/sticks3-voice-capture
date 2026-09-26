@@ -26,8 +26,14 @@ real playback, reboot persistence, 20-minute continuous recording, forced-reset
 resilience, `.part` recovery) are passing.
 
 Known limitations:
-- The firmware image is within ~2% of the 2 MiB OTA slot limit — expect this
-  to need `sdkconfig` size tuning before more features can be added.
+- OTA slots are ~2.69 MiB each (0x2b0000); the internal `storage` partition
+  is ~2.56 MB (0x290000, ~17 min of 20 kbps Opus). Recordings prefer the TF
+  HAT SD card.
+- The first time a build with this partition layout is flashed, the old
+  `storage` contents make the new partition fail to mount. Sync all internal
+  recordings first, then over USB run `idf.py -p PORT flash` and
+  `python -m esptool --chip esp32s3 -p PORT erase_region 0x570000 0x290000`
+  (the blank partition is formatted as FAT on first boot).
 - `light_sleep_enable` is forced `false` for USB-Serial-JTAG debug stability;
   this needs to be reverted for accurate battery-runtime numbers.
 - Off-LAN sync depends on a Tailscale Funnel URL you set up yourself (see

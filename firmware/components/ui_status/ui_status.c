@@ -71,6 +71,8 @@ static char s_hint_text[UI_HINT_TEXT_MAX] = "Starting up";
 static char s_idle_hint_text[UI_HINT_TEXT_MAX] = "Hold to Talk";
 static char s_device_name[16] = "BLE";
 static bool s_dimmed;
+/* Set once at boot, before any recording starts. */
+static bool s_recording_on_sd;
 
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io,
                                     esp_lcd_panel_io_event_data_t *edata,
@@ -447,13 +449,18 @@ void ui_status_set_idle_dimmed(bool dimmed)
     _lock_release(&s_lvgl_lock);
 }
 
+void ui_status_set_recording_on_sd(bool on_sd)
+{
+    s_recording_on_sd = on_sd;
+}
+
 void ui_status_set_recording(uint32_t session_id)
 {
     ESP_LOGD(TAG, "recording session %" PRIu32, session_id);
     (void)session_id;
 
     _lock_acquire(&s_lvgl_lock);
-    s_scene = UI_STATUS_ICON_RECORDING;
+    s_scene = s_recording_on_sd ? UI_STATUS_ICON_RECORDING_SD : UI_STATUS_ICON_RECORDING;
     strlcpy(s_status_text, "Listening", sizeof(s_status_text));
     strlcpy(s_hint_text, "Speak now", sizeof(s_hint_text));
     render_current_locked();
@@ -498,6 +505,11 @@ void ui_status_set_syncing(const char *hint)
 {
     ESP_LOGD(TAG, "sync: %s", hint ? hint : "");
     set_scene(UI_STATUS_ICON_PAIRING, "Sync", hint ? hint : "");
+}
+
+void ui_status_set_wifi_connected(const char *hint)
+{
+    set_scene(UI_STATUS_ICON_WIFI, "Wi-Fi", hint ? hint : "");
 }
 
 void ui_status_set_sync_success(const char *hint)

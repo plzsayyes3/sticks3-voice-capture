@@ -116,6 +116,7 @@ typedef enum {
     APP_EVENT_OTA_END,
     APP_EVENT_HOST_RESPONSE_TIMEOUT,
     APP_EVENT_WIFI_SYNC_DONE,
+    APP_EVENT_WIFI_CONNECTED,
 } app_event_type_t;
 
 typedef struct {
@@ -461,6 +462,12 @@ static void wifi_sync_done_cb(wifi_sync_result_t result, unsigned uploaded, unsi
     queue_wifi_sync_done_event(result, uploaded, failed);
 }
 
+/* Same threading rule as wifi_sync_done_cb. */
+static void wifi_sync_connected_cb(void)
+{
+    queue_app_event(APP_EVENT_WIFI_CONNECTED);
+}
+
 static void queue_app_event_from_isr(app_event_type_t type, BaseType_t *high_task_woken)
 {
     if (s_app_event_queue) {
@@ -758,6 +765,9 @@ static void app_event_task(void *arg)
         }
         case APP_EVENT_WIFI_SYNC_DONE:
             show_sync_result((wifi_sync_result_t)event.error, event.written, event.size);
+            break;
+        case APP_EVENT_WIFI_CONNECTED:
+            ui_status_set_wifi_connected("Uploading...");
             break;
         case APP_EVENT_UI_STATE:
             apply_app_ui_state(event.state, event.text);
@@ -1191,6 +1201,7 @@ void app_main(void)
                  esp_err_to_name(wifi_sync_err));
     }
     wifi_sync_set_done_callback(wifi_sync_done_cb);
+    wifi_sync_set_connected_callback(wifi_sync_connected_cb);
 
     esp_err_t ble_err = voice_ble_init();
     if (ble_err != ESP_OK) {
@@ -1207,6 +1218,7 @@ void app_main(void)
         ui_status_set_error("Audio init failed");
     } else {
         audio_pipeline_set_error_callback(audio_pipeline_error_cb);
+        ui_status_set_recording_on_sd(recording_store_on_sd());
         apply_interaction_mode(INTERACTION_MODE_CLICK_TO_TALK);
         /* This app is local-only now (no BLE companion app), so BLE never
          * connects in normal use — showing "Pairing" here would mean the
