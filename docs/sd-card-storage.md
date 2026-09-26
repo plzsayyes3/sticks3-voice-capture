@@ -1,5 +1,7 @@
 # TF HAT SDカード保存 — 調査・実装記録（2026-09-26）
 
+> 統合ブランチ `integration/sd-card-rady` に、以下の内容をすべてまとめてある（ラディの状態アイコンと受信サーバーの修正を含む）。
+
 StickS3 + M5Stack TF HAT（SKU 9551）で録音をSDカードに保存できるようにした作業の記録。
 実機が手元にない状態で実装まで進めたため、**実機での確認が済んでいない項目**を最後にまとめている。
 
@@ -26,14 +28,20 @@ StickS3 + M5Stack TF HAT（SKU 9551）で録音をSDカードに保存できる�
 
 ## 3. 録音ファームへの組み込み（ブランチ構成）
 
-push済みのブランチはない（すべてローカル）。
+push済みのブランチはない（すべてローカル）。作業はブランチを積み重ねて進め、最後に1本にまとめた。
 
 ```
 origin/main (9e7926a)
-└ feature/sd-card-storage            SDカード保存＋内蔵フラッシュへのフォールバック
-  └ feature/smaller-internal-storage  本体の録音領域を2.56MBに縮小し、OTAスロットを拡張
-    └ feature/split-on-silence        30分を過ぎたら次の無音でファイルを区切る
+└ integration/sd-card-rady
+  ├ SDカード保存＋内蔵フラッシュへのフォールバック    （元: feature/sd-card-storage）
+  ├ 本体の録音領域を2.56MBに縮小、OTAスロットを拡張   （元: feature/smaller-internal-storage）
+  ├ ラディの状態アイコン（オレンジ／緑／ピンク）       （元: feature/rady-pink-sd）
+  ├ 30分を過ぎたら次の無音でファイルを区切る          （元: feature/split-on-silence）
+  ├ Wi-Fi接続中の水色ラディ                          （元: feature/rady-wifi-split）
+  └ 受信サーバー: 無音の録音を完了扱いにする           （元: fix/receiver-no-speech）
 ```
+
+元のブランチは、すべてこの統合ブランチに内容ごと含まれている（`git cherry` で確認済み）。
 
 ### feature/sd-card-storage
 
@@ -69,6 +77,20 @@ origin/main (9e7926a)
   `0.004` だと小さな声の途中で区切ることがあったため、`0.001` にした。
 - 書き込みキューを約10秒（170パケット）に増やしてPSRAMに置いた。書き込みタスクのスタックは8KBにした。
 
+### ラディの状態アイコン
+
+| 画面の状態 | ラディ |
+|---|---|
+| 待機、ペアリング、同期の開始・失敗、処理中など | オレンジ |
+| 内蔵フラッシュに録音中 | 緑（音符） |
+| SDカードに録音中 | ピンク（音符）。起動時に `recording_store_on_sd()` で決まる |
+| Wi-Fi同期でネットワークにつながってから、同期が終わるまで | 水色（キラキラ）。`wifi_sync` の接続通知で切り替わり、探している間や失敗時には出ない |
+
+- アイコンは `scripts/prepare-rady-icons.py` でスプライトシートから生成する（Pillowが必要）。
+  元の6枚は、再生成しても1バイトも変わらないことを確認済み。
+- 1枚112×112のARGB8888で約50KB。ピンクと水色を足しても、OTAスロットは約610KB空いている。
+- テスト: `python3 -m unittest discover -s tests`（色の段と、状態との対応を確認する）
+
 ## 4. Mac側の受信サーバー（local-receiver）
 
 ### 見つかった問題と対処（2026-09-26）
@@ -94,15 +116,28 @@ tail -f ~/sticks3-voice-capture-data/receiver.log
 launchctl kickstart -k gui/$(id -u)/com.plzsayyes3.sticks3-localreceiver
 ```
 
+### 無音の録音をやり直し続けていた件（修正済み）
+
+- whisper-cliが正常に終わっても、結果が空（無音や1秒未満の録音）だと例外になり、`done/` が作られなかった。
+  そのため、受信サーバーを起動し直すたびに同じ録音をやり直していた（9件）。
+- `NoSpeechError` として区別し、`mynotebook_status: "no_speech"` で完了扱いにする（ノートは作らない）。
+  それ以外の失敗は、今までどおり未完了のまま残してやり直す。
+- 修正後、全103件が完了した（ノート作成94件、話し声なし9件）。
+- 注意: 動いている受信サーバーは、メインのチェックアウト（`~/GitHub/sticks3-voice-capture/local-receiver`）の
+  `app.py` を使う。修正版の `app.py` をそこに上書きしてあるので、そのブランチでは未コミットの変更として見える。
+
 ### 受信後の流れ
 
 受信（トークン確認、`recordings/` に保存してディスクへ確定、SHA-256で重複を判定）→ 201を返し、本体は録音を削除する
 → 文字起こし（ffmpegで16kHzのWAVに変換 → whisper-cli large-v3-turbo＋VAD、1件ずつ処理）
 → `notes/` にMarkdownを作成 → GitHub `plzsayyes3/mynotebook` の `00_inbox/` へ追加 → `done/` に完了を記録する。
 
-## 5. 実機が戻ったらやること
+## 5. 実機への反映と確認
 
-### 書き込み手順（パーティション変更を含む）
+2026-09-26 夜に、新しいパーティション表への書き込みと、録音領域の消去まで実施済み。
+書き込む前に、旧来の録音領域を丸ごと読み出し、未送信の録音がないことを確認した（生データは下記のバックアップに保存）。
+
+### 書き込み手順（パーティション変更を含む。旧割り当ての本体に初めて入れるとき）
 
 1. **今のファームのうちに**、Wi-Fi同期で内蔵フラッシュの録音を送り切る（次の手順で消える）。
 2. USBで書き込む（OTAではできない）。
@@ -117,11 +152,17 @@ launchctl kickstart -k gui/$(id -u)/com.plzsayyes3.sticks3-localreceiver
    python -m esptool --chip esp32s3 -p /dev/cu.usbmodem101 erase_region 0x570000 0x290000
    ```
 
+### 確認済み
+
+- [x] 録音がSDカードの `REC/` に `.ogg` として保存される（`.part` → `.ogg` の名前変更を含む。8秒の録音で確認）
+- [x] Wi-Fi同期でSDカードからアップロードし、Macで文字起こし → `mynotebook` への登録まで通る
+- [x] 待機中はオレンジ、SDカードに録音中はピンクのラディになる（実機の画面で確認）
+
 ### 未確認の項目
 
-- [ ] 実際の録音がSDカードの `REC/` に `.ogg` として保存されるか（20MHzでの連続書き込み、`.part` → `.ogg` の名前変更）
-- [ ] Wi-Fi同期でSDカードからアップロードして削除できるか
+- [ ] Wi-Fi同期でつながったときに水色のラディになるか
 - [ ] SDカードに未送信がないとき、内蔵フラッシュの未送信分を送れるか
+- [ ] SDカードがない状態で起動したとき、消去済みの内蔵フラッシュに録音できるか（緑のラディ）
 - [ ] 30分超の録音が無音で区切られるか、区切り目で音が欠けたりノイズが入ったりしないか
       （短時間で試すなら、区切りを数分にしたテスト用ビルドを作る）
 - [ ] 区切った各ファイルがMacで別々のノートになるか
@@ -131,6 +172,9 @@ launchctl kickstart -k gui/$(id -u)/com.plzsayyes3.sticks3-localreceiver
 
 - ワークツリー: `/private/tmp/sticks3-sd-card-storage`（`/private/tmp` なのでMacの再起動で消えることがある。
   ブランチとコミットはメインリポジトリの `.git` にあるので残る）
+- `~/sticks3-voice-capture-data/firmware-backups/` にあるバックアップ:
+  - `2026-09-26_sd-build_before-rady_0x0_0x410000.bin`: ラディを入れる前のSD対応版（旧割り当て）
+  - `2026-09-26_storage-old-layout_0x410000_0x3f0000.bin`: 消去する前の旧来の録音領域（中身は空で、未送信の録音はなかった）
 - SD対応前のフラッシュのバックアップ（0x0〜0x410000。旧パーティション表、ブートローダー、両OTAスロット）:
   `~/sticks3-voice-capture-data/firmware-backups/2026-09-26_pre-sd_flash_0x0_0x410000.bin`
 

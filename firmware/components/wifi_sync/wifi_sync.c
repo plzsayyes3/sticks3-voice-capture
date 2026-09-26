@@ -35,7 +35,8 @@ static const char *TAG = "wifi_sync";
  * pass (see collect_sync_candidates) instead of mutating entries while
  * readdir() is still iterating the directory, which is unsafe on FATFS
  * (entries can be skipped or re-visited). 48 is far above what the
- * ~2.56MB storage partition holds at typical recording sizes. */
+ * ~2.56MB internal partition holds; on the SD card more can pile up, and
+ * anything past 48 simply syncs on the next run. */
 #define MAX_SYNC_CANDIDATES 48
 
 #define WIFI_CONNECTED_BIT BIT0
