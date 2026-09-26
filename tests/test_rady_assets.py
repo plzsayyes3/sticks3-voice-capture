@@ -8,6 +8,7 @@ ICON_NAMES = (
     "rady_pairing",
     "rady_ready",
     "rady_listening",
+    "rady_listening_sd",
     "rady_thinking",
     "rady_resting",
     "rady_error",
@@ -51,12 +52,23 @@ class RadyAssetTests(unittest.TestCase):
         self.assertGreater(green, red)
         self.assertGreater(green, blue)
 
+    def test_sd_recording_icon_uses_the_pink_row(self):
+        data = (ASSET_DIR / "rady_listening_sd_argb8888.bin").read_bytes()
+        red = average_visible_channel(data, 2)
+        green = average_visible_channel(data, 1)
+        blue = average_visible_channel(data, 0)
+        self.assertGreater(red, green + 15)
+        # Pink keeps blue level with green; orange drops blue ~27 below green.
+        self.assertLess(abs(blue - green), 10)
+
     def test_ready_and_recording_scenes_reference_rady_assets(self):
         source = (ASSET_DIR.parent / "ui_status_icons.c").read_text()
         self.assertIn("_binary_rady_ready_argb8888_bin_start", source)
         self.assertIn("_binary_rady_listening_argb8888_bin_start", source)
         self.assertIn("case UI_STATUS_ICON_IDLE:\n        return &s_rady_ready;", source)
         self.assertIn("case UI_STATUS_ICON_RECORDING:\n        return &s_rady_listening;", source)
+        self.assertIn("_binary_rady_listening_sd_argb8888_bin_start", source)
+        self.assertIn("case UI_STATUS_ICON_RECORDING_SD:\n        return &s_rady_listening_sd;", source)
 
 
 if __name__ == "__main__":

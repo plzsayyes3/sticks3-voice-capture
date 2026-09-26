@@ -1207,6 +1207,7 @@ void app_main(void)
         ui_status_set_error("Audio init failed");
     } else {
         audio_pipeline_set_error_callback(audio_pipeline_error_cb);
+        ui_status_set_recording_on_sd(recording_store_on_sd());
         apply_interaction_mode(INTERACTION_MODE_CLICK_TO_TALK);
         /* This app is local-only now (no BLE companion app), so BLE never
          * connects in normal use — showing "Pairing" here would mean the

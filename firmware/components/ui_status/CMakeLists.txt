@@ -5,6 +5,7 @@ idf_component_register(
         "assets/rady_pairing_argb8888.bin"
         "assets/rady_ready_argb8888.bin"
         "assets/rady_listening_argb8888.bin"
+        "assets/rady_listening_sd_argb8888.bin"
         "assets/rady_thinking_argb8888.bin"
         "assets/rady_resting_argb8888.bin"
         "assets/rady_error_argb8888.bin"

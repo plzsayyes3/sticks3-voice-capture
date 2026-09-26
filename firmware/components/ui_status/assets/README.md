@@ -13,9 +13,8 @@ ARGB8888. They are embedded by `../CMakeLists.txt`.
 Current device mapping:
 
 - Standby and supporting UI scenes: orange Rady.
-- Recording (SD card or internal flash): green Rady with music notes.
-- Pink SD-recording is not mapped yet: `recording_store_on_sd()` exposes the
-  state, but another icon (~50KB) does not fit the 2MiB OTA slot until the
-  partition layout grows.
+- Recording to internal flash: green Rady with music notes.
+- Recording to the SD card: pink Rady with music notes (chosen at boot from
+  `recording_store_on_sd()`).
 - Sky-blue Wi-Fi-connected is not mapped: `ui_status_set_syncing()` is shown
   both before connecting and for failed syncs, so it is not a connected state.

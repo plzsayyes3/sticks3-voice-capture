@@ -14,6 +14,8 @@ void ui_status_set_idle_hint(const char *hint);
 void ui_status_set_idle(void);
 void ui_status_set_idle_dimmed(bool dimmed);
 void ui_status_set_recording(uint32_t session_id);
+/* Where recordings go is fixed at boot; picks the SD (pink) recording icon. */
+void ui_status_set_recording_on_sd(bool on_sd);
 void ui_status_set_battery(int level_percent, bool charging, bool usb_powered);
 void ui_status_set_partial_text(const char *text);
 void ui_status_set_capacity(const char *text);

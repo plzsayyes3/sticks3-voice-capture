@@ -10,6 +10,7 @@
 extern const uint8_t rady_pairing_start[] asm("_binary_rady_pairing_argb8888_bin_start");
 extern const uint8_t rady_ready_start[] asm("_binary_rady_ready_argb8888_bin_start");
 extern const uint8_t rady_listening_start[] asm("_binary_rady_listening_argb8888_bin_start");
+extern const uint8_t rady_listening_sd_start[] asm("_binary_rady_listening_sd_argb8888_bin_start");
 extern const uint8_t rady_thinking_start[] asm("_binary_rady_thinking_argb8888_bin_start");
 extern const uint8_t rady_resting_start[] asm("_binary_rady_resting_argb8888_bin_start");
 extern const uint8_t rady_error_start[] asm("_binary_rady_error_argb8888_bin_start");
@@ -47,6 +48,17 @@ static const lv_image_dsc_t s_rady_listening = {
     .data = rady_listening_start,
 };
 
+static const lv_image_dsc_t s_rady_listening_sd = {
+    .header.magic = LV_IMAGE_HEADER_MAGIC,
+    .header.cf = LV_COLOR_FORMAT_ARGB8888,
+    .header.flags = 0,
+    .header.w = RADY_ICON_SIZE,
+    .header.h = RADY_ICON_SIZE,
+    .header.stride = RADY_ICON_STRIDE,
+    .data_size = RADY_ICON_DATA_SIZE,
+    .data = rady_listening_sd_start,
+};
+
 static const lv_image_dsc_t s_rady_thinking = {
     .header.magic = LV_IMAGE_HEADER_MAGIC,
     .header.cf = LV_COLOR_FORMAT_ARGB8888,
@@ -82,11 +94,9 @@ static const lv_image_dsc_t s_rady_error = {
 
 static const lv_image_dsc_t *get_scene_image(ui_status_icon_scene_t scene)
 {
-    /* Recording shows green whether it goes to the SD card or internal
-     * flash. recording_store_on_sd() could drive a pink SD variant, but one
-     * more 112x112 icon (~50KB) does not fit the 2MiB OTA slot on this
-     * partition layout. Keep future SD and Wi-Fi colors tied to explicit
-     * application states instead of inferring them. */
+    /* Recording is green for internal flash and pink for the SD card; the
+     * caller picks the scene from recording_store_on_sd(). Keep future Wi-Fi
+     * colors tied to explicit application states instead of inferring them. */
     switch (scene) {
     case UI_STATUS_ICON_BOOT:
     case UI_STATUS_ICON_PAIRING:
@@ -97,6 +107,8 @@ static const lv_image_dsc_t *get_scene_image(ui_status_icon_scene_t scene)
         return &s_rady_resting;
     case UI_STATUS_ICON_RECORDING:
         return &s_rady_listening;
+    case UI_STATUS_ICON_RECORDING_SD:
+        return &s_rady_listening_sd;
     case UI_STATUS_ICON_TRANSCRIBING:
         return &s_rady_thinking;
     case UI_STATUS_ICON_ERROR:
