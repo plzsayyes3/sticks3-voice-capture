@@ -184,6 +184,40 @@ def test_recordings_are_transcribed_one_at_a_time(client, app_module):
     assert state["max_concurrent"] == 1
 
 
+def test_no_speech_recording_completes_without_note(client, app_module, monkeypatch):
+    pushed = []
+
+    def silent(ogg_path):
+        raise app_module.NoSpeechError("whisper-cli produced an empty transcript")
+
+    monkeypatch.setattr(app_module, "transcribe_ogg", silent)
+    monkeypatch.setattr(app_module, "push_to_mynotebook",
+                        lambda path, markdown: pushed.append(path) or "created")
+
+    response = client.post("/v1/recordings", data=b"OggS-silent",
+                           headers=auth_headers("00000001-silent00"))
+    assert response.status_code == 201
+    assert wait_for_done(app_module, "00000001-silent00")
+
+    import json  # noqa: PLC0415
+    done = json.loads((app_module.DONE_DIR / "00000001-silent00.json").read_text())
+    assert done["mynotebook_status"] == "no_speech"
+    assert done["mynotebook_path"] is None
+    assert pushed == []
+    assert not (app_module.NOTES_DIR / "00000001-silent00.md").exists()
+
+
+def test_other_transcription_failures_stay_pending(client, app_module, monkeypatch):
+    def crash(ogg_path):
+        raise RuntimeError("whisper-cli exited -6")
+
+    monkeypatch.setattr(app_module, "transcribe_ogg", crash)
+    response = client.post("/v1/recordings", data=b"OggS-crash",
+                           headers=auth_headers("00000001-crash000"))
+    assert response.status_code == 201
+    assert not wait_for_done(app_module, "00000001-crash000", timeout=0.5)
+
+
 def test_reprocess_pending_recordings_resumes_unfinished(app_module):
     recording_id = "rec-crash-before-done"
     app_module.store_recording_durably(recording_id, b"OggS-resumed")
