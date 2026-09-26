@@ -1,6 +1,7 @@
 #include "audio_pipeline.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -8,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -28,13 +30,37 @@ static const char *TAG = "audio_pipeline";
 #define OPUS_MAX_PACKET_SIZE 220
 #define OPUS_COMPLEXITY 1
 
-#define WRITE_QUEUE_DEPTH 50
+/* ~10s of audio. Rolling over to the next file (finalize + open) happens in
+ * the writer while capture keeps running, so the queue must absorb that
+ * plus any SD card write stall. Held in PSRAM: ~39KB is too much for the
+ * already-tight internal RAM, and only tasks (never ISRs) touch it. */
+#define WRITE_QUEUE_DEPTH 170
 #define TASK_EXIT_WAIT_MS 5000
 #define WRITER_POLL_MS 100
+
+#define FRAMES_PER_MINUTE ((60 * 1000) / AUDIO_FRAME_MS)
+/* Long recordings are split into separate files so each one uploads and
+ * transcribes on its own. Past SPLIT_AFTER_MIN the next pause in speech
+ * ends the file; if nobody pauses by SPLIT_FORCE_MIN, split anyway. */
+#define SPLIT_AFTER_FRAMES (30 * FRAMES_PER_MINUTE)
+#define SPLIT_FORCE_FRAMES (35 * FRAMES_PER_MINUTE)
+/* A pause is this many consecutive quiet frames (~0.6s). */
+#define SILENCE_MIN_FRAMES 10
+/* A frame is quiet when its RMS stays close to the tracked noise floor. */
+#define SILENCE_FLOOR_RATIO 2.0f
+#define SILENCE_RMS_MARGIN 40.0f
+/* The floor follows quieter frames immediately and louder ones slowly
+ * (~60s time constant) so ongoing speech does not drag it upward. Tuned
+ * offline on a real 24-min recording: 0.004 let the floor climb to
+ * near-median speech level and split inside soft speech; 0.001 kept every
+ * split in a clear pause (<= half the local median RMS) with no forced
+ * splits. */
+#define NOISE_FLOOR_RISE 0.001f
 
 typedef struct {
     uint32_t seq;
     uint16_t len;
+    bool split_after;
     uint8_t data[OPUS_MAX_PACKET_SIZE];
 } audio_packet_t;
 
@@ -44,6 +70,7 @@ static atomic_int s_last_error;
 static bool s_initialized;
 static uint32_t s_session_id;
 static uint32_t s_seq;
+static uint16_t s_pre_skip_48k;
 static TaskHandle_t s_audio_task;
 static TaskHandle_t s_writer_task;
 static QueueHandle_t s_write_queue;
@@ -261,6 +288,16 @@ static void deinit_session_resources(void)
     ESP_LOGI(TAG, "session resources released");
 }
 
+static float frame_rms(const int16_t *samples, size_t count)
+{
+    float sum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        const float v = (float)samples[i];
+        sum += v * v;
+    }
+    return sqrtf(sum / (float)count);
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
@@ -268,6 +305,9 @@ static void audio_task(void *arg)
     int16_t mono[AUDIO_FRAME_SAMPLES];
     uint8_t opus_buf[OPUS_MAX_PACKET_SIZE];
     uint32_t encoded_packets = 0;
+    uint32_t frames_in_file = 0;
+    uint32_t quiet_run = 0;
+    float noise_floor = -1.0f;
 
     while (atomic_load(&s_running)) {
         esp_err_t err = esp_codec_dev_read(s_codec, mono, sizeof(mono));
@@ -286,15 +326,41 @@ static void audio_task(void *arg)
             break;
         }
 
+        const float rms = frame_rms(mono, AUDIO_FRAME_SAMPLES);
+        if (noise_floor < 0.0f || rms < noise_floor) {
+            noise_floor = rms;
+        } else {
+            noise_floor += (rms - noise_floor) * NOISE_FLOOR_RISE;
+        }
+        const bool quiet = rms <= noise_floor * SILENCE_FLOOR_RATIO + SILENCE_RMS_MARGIN;
+        quiet_run = quiet ? quiet_run + 1 : 0;
+        frames_in_file++;
+
+        bool split_after = false;
+        if (frames_in_file >= SPLIT_FORCE_FRAMES) {
+            split_after = true;
+            ESP_LOGW(TAG, "no pause within %d min; splitting file anyway",
+                     SPLIT_FORCE_FRAMES / FRAMES_PER_MINUTE);
+        } else if (frames_in_file >= SPLIT_AFTER_FRAMES && quiet_run >= SILENCE_MIN_FRAMES) {
+            split_after = true;
+            ESP_LOGI(TAG, "pause after %" PRIu32 " frames; splitting file (rms=%.0f floor=%.0f)",
+                     frames_in_file, rms, noise_floor);
+        }
+        if (split_after) {
+            frames_in_file = 0;
+            quiet_run = 0;
+        }
+
         audio_packet_t packet = {
             .seq = s_seq,
             .len = (uint16_t)encoded,
+            .split_after = split_after,
         };
         memcpy(packet.data, opus_buf, (size_t)encoded);
 
         if (xQueueSend(s_write_queue, &packet, 0) != pdTRUE) {
             report_failure(ESP_ERR_TIMEOUT,
-                           "Flash writer queue full; refusing silent packet loss");
+                           "Writer queue full; refusing silent packet loss");
             break;
         }
 
@@ -329,6 +395,25 @@ static void writer_task(void *arg)
                 break;
             }
             written_packets++;
+
+            if (packet.split_after) {
+                /* Capture keeps running meanwhile; the queue absorbs it. */
+                long part_size = 0;
+                err = recording_store_finish(&part_size);
+                if (err != ESP_OK) {
+                    report_failure(err, "split: finalize part failed");
+                    break;
+                }
+                ESP_LOGI(TAG, "part saved: packets=%" PRIu32 " size=%ld",
+                         written_packets, part_size);
+                written_packets = 0;
+                err = recording_store_begin(s_session_id, AUDIO_SAMPLE_RATE, s_pre_skip_48k);
+                if (err != ESP_OK) {
+                    report_failure(err, "split: open next part failed");
+                    break;
+                }
+                ESP_LOGI(TAG, "next part: %s", recording_store_current_path());
+            }
             continue;
         }
 
@@ -370,7 +455,8 @@ esp_err_t audio_pipeline_init(void)
 
     ESP_RETURN_ON_ERROR(recording_store_init(), TAG, "recording store init");
 
-    s_write_queue = xQueueCreate(WRITE_QUEUE_DEPTH, sizeof(audio_packet_t));
+    s_write_queue = xQueueCreateWithCaps(WRITE_QUEUE_DEPTH, sizeof(audio_packet_t),
+                                         MALLOC_CAP_SPIRAM);
     ESP_RETURN_ON_FALSE(s_write_queue != NULL, ESP_ERR_NO_MEM, TAG,
                         "create write queue");
 
@@ -433,6 +519,7 @@ esp_err_t audio_pipeline_start(uint32_t session_id)
 
     xQueueReset(s_write_queue);
     s_session_id = session_id;
+    s_pre_skip_48k = (uint16_t)scaled_pre_skip;
     s_seq = 0;
     opus_encoder_ctl(s_opus_encoder, OPUS_RESET_STATE);
     atomic_store(&s_failed, false);
@@ -469,9 +556,11 @@ esp_err_t audio_pipeline_start(uint32_t session_id)
         return ESP_ERR_NO_MEM;
     }
 
+    /* 8192: the writer also finalizes and opens files when a long recording
+     * is split (fsync, rename, Ogg header pages), not just appends. */
     ok = xTaskCreatePinnedToCore(writer_task,
                                  "record_writer",
-                                 6144,
+                                 8192,
                                  NULL,
                                  6,
                                  &s_writer_task,
